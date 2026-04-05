@@ -27,6 +27,8 @@ parking_lot = "0.12"
 memmap2 = "0.9"
 libc = "0.2"
 dashmap = "5"
+ahash = "0.8"
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3

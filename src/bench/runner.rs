@@ -4,16 +4,118 @@ use serde_json::{json, Value};
 use std::hint::black_box;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::storage::StorageEngine;
+
+// ─────────────────────────────────────────────────────────
+// Latency collector — samples per-op latencies for percentile analysis
+// ─────────────────────────────────────────────────────────
+
+struct LatencyCollector {
+    samples: Vec<u64>, // nanoseconds
+}
+
+impl LatencyCollector {
+    fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+        }
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(cap),
+        }
+    }
+
+    fn record(&mut self, ns: u64) {
+        self.samples.push(ns);
+    }
+
+    fn merge(collectors: Vec<Self>) -> Self {
+        let total: usize = collectors.iter().map(|c| c.samples.len()).sum();
+        let mut merged = Self::with_capacity(total);
+        for mut c in collectors {
+            merged.samples.append(&mut c.samples);
+        }
+        merged.samples.sort_unstable();
+        merged
+    }
+
+    fn percentile(&self, p: f64) -> u64 {
+        if self.samples.is_empty() {
+            return 0;
+        }
+        let idx = ((p / 100.0) * (self.samples.len() as f64 - 1.0)).ceil() as usize;
+        self.samples[idx.min(self.samples.len() - 1)]
+    }
+
+    fn p50(&self) -> u64 {
+        self.percentile(50.0)
+    }
+    fn p95(&self) -> u64 {
+        self.percentile(95.0)
+    }
+    fn p99(&self) -> u64 {
+        self.percentile(99.0)
+    }
+    fn p999(&self) -> u64 {
+        self.percentile(99.9)
+    }
+    fn min(&self) -> u64 {
+        self.samples.first().copied().unwrap_or(0)
+    }
+    fn max(&self) -> u64 {
+        self.samples.last().copied().unwrap_or(0)
+    }
+    fn avg(&self) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        self.samples.iter().sum::<u64>() as f64 / self.samples.len() as f64
+    }
+    fn count(&self) -> usize {
+        self.samples.len()
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// Resource utilization tracker
+// ─────────────────────────────────────────────────────────
+
+fn get_rss_bytes() -> u64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<u64>() {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+// ─────────────────────────────────────────────────────────
+// Bench result with full metrics
+// ─────────────────────────────────────────────────────────
 
 struct BenchResult {
     name: String,
     ops: u64,
     elapsed: Duration,
     data_size: u64,
+    latency: Option<LatencyCollector>,
+    read_ops: u64,
+    write_ops: u64,
+    mem_before: u64,
+    mem_after: u64,
 }
 
 impl BenchResult {
@@ -22,7 +124,11 @@ impl BenchResult {
     }
 
     fn avg_latency_ns(&self) -> f64 {
-        self.elapsed.as_nanos() as f64 / self.ops as f64
+        if let Some(ref l) = self.latency {
+            l.avg()
+        } else {
+            self.elapsed.as_nanos() as f64 / self.ops as f64
+        }
     }
 
     fn throughput_mb(&self) -> f64 {
@@ -31,7 +137,35 @@ impl BenchResult {
         }
         (self.data_size as f64 / (1024.0 * 1024.0)) / self.elapsed.as_secs_f64()
     }
+
+    fn mem_delta_mb(&self) -> f64 {
+        if self.mem_after > self.mem_before {
+            (self.mem_after - self.mem_before) as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn rw_ratio_str(&self) -> String {
+        if self.read_ops == 0 && self.write_ops == 0 {
+            return "—".to_string();
+        }
+        if self.read_ops == 0 {
+            return "0:100 (R:W)".to_string();
+        }
+        if self.write_ops == 0 {
+            return "100:0 (R:W)".to_string();
+        }
+        let total = (self.read_ops + self.write_ops) as f64;
+        let r_pct = (self.read_ops as f64 / total * 100.0).round() as u64;
+        let w_pct = 100 - r_pct;
+        format!("{}:{} (R:W)", r_pct, w_pct)
+    }
 }
+
+// ─────────────────────────────────────────────────────────
+// Formatting helpers
+// ─────────────────────────────────────────────────────────
 
 fn format_ops(n: f64) -> String {
     if n >= 1_000_000.0 {
@@ -50,6 +184,22 @@ fn format_latency(ns: f64) -> String {
         format!("{:.2}μs", ns / 1_000.0)
     } else {
         format!("{:.0}ns", ns)
+    }
+}
+
+fn format_latency_u64(ns: u64) -> String {
+    format_latency(ns as f64)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -88,6 +238,50 @@ fn print_result(result: &BenchResult, idx: usize, total: usize) {
         "▸".truecolor(120, 80, 255),
         throughput_str.truecolor(180, 180, 255),
     );
+
+    // Latency percentiles
+    if let Some(ref lat) = result.latency {
+        if lat.count() > 0 {
+            println!(
+                "        {} P50 {}  P95 {}  P99 {}  P99.9 {}",
+                "▸".truecolor(120, 80, 255),
+                format_latency_u64(lat.p50()).truecolor(100, 255, 200),
+                format_latency_u64(lat.p95()).truecolor(200, 255, 100),
+                format_latency_u64(lat.p99()).truecolor(255, 200, 100).bold(),
+                format_latency_u64(lat.p999()).truecolor(255, 120, 80),
+            );
+            println!(
+                "        {} min {}  max {}  samples {}",
+                "▸".truecolor(80, 80, 120),
+                format_latency_u64(lat.min()).dimmed(),
+                format_latency_u64(lat.max()).dimmed(),
+                lat.count().to_string().dimmed(),
+            );
+        }
+    }
+
+    // Read/write ratio
+    if result.read_ops > 0 || result.write_ops > 0 {
+        println!(
+            "        {} R/W ratio: {}  (reads: {} writes: {})",
+            "▸".truecolor(80, 80, 120),
+            result.rw_ratio_str().truecolor(180, 200, 255),
+            result.read_ops.to_string().dimmed(),
+            result.write_ops.to_string().dimmed(),
+        );
+    }
+
+    // Resource utilization
+    if result.mem_after > 0 {
+        println!(
+            "        {} Memory: {} → {} (Δ {:.1} MB)",
+            "▸".truecolor(80, 80, 120),
+            format_bytes(result.mem_before).dimmed(),
+            format_bytes(result.mem_after).dimmed(),
+            result.mem_delta_mb(),
+        );
+    }
+
     println!(
         "        {} {} ops in {:.2}ms",
         "↳".dimmed(),
@@ -124,6 +318,10 @@ fn fill_table(table: &DashMap<String, Arc<[u8]>>, keys: &[String], value: &Arc<[
     }
 }
 
+/// Sampling rate for latency collection. We sample 1-in-N ops to avoid
+/// measurement overhead dominating the benchmark on very fast paths.
+const LATENCY_SAMPLE_RATE: u64 = 8;
+
 pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
     let bench_dir = data_dir.join("_benchmark_temp");
     if bench_dir.exists() {
@@ -131,6 +329,8 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
     }
 
     let num_threads = num_cpus();
+    let global_start = Instant::now();
+    let initial_rss = get_rss_bytes();
 
     println!();
     println!(
@@ -152,10 +352,15 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         "→".truecolor(120, 80, 255),
         num_threads.to_string().bold()
     );
+    println!(
+        "  {} Initial RSS: {}",
+        "→".truecolor(120, 80, 255),
+        format_bytes(initial_rss).dimmed()
+    );
     println!();
 
     let mut results: Vec<BenchResult> = Vec::new();
-    let total_tests = 10;
+    let total_tests = 12;
 
     // ─────────────────────────────────────────────────
     // TEST 1: Parallel memory writes (all threads, pre-allocated)
@@ -166,6 +371,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(1.0 / total_tests as f64, 20),
             "Memory writes...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t1"))?;
         let ops_per_thread = 500_000u64 / num_threads as u64;
         let total_ops = ops_per_thread * num_threads as u64;
@@ -174,9 +380,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
 
         let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
         let doc_size = doc_bytes.len() as u64;
-        let doc: Arc<[u8]> = Arc::from(doc_bytes.into_boxed_slice());
 
-        // Pre-compute keys per thread
         let thread_keys: Vec<Vec<String>> = (0..num_threads)
             .map(|t| {
                 (0..ops_per_thread)
@@ -186,19 +390,31 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             .collect();
 
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let table = &table;
-                let doc = &doc;
+                let raw = doc_bytes.as_slice();
                 let keys = &thread_keys[t];
-                s.spawn(move || {
-                    for key in keys {
-                        table.insert(key.clone(), Arc::clone(doc));
+                handles.push(s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
+                    for (i, key) in keys.iter().enumerate() {
+                        let op_start = Instant::now();
+                        table.insert(key.clone(), Arc::clone(&doc));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -211,6 +427,11 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             ops: total_ops,
             elapsed,
             data_size: total_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: total_ops,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -223,6 +444,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(2.0 / total_tests as f64, 20),
             "Memory reads...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t2"))?;
         let data_count = 500_000u64;
         engine.create_table_with_capacity("bench", data_count as usize)?;
@@ -236,27 +458,37 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         fill_table(&table, &keys, &doc);
         drop(table);
 
-        // Lock-free snapshot for maximum read throughput
         let snapshot = Arc::new(engine.snapshot("bench").unwrap());
         let ops_per_thread = 500_000u64 / num_threads as u64;
         let total_ops = ops_per_thread * num_threads as u64;
         let keys = Arc::new(keys);
 
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let snapshot = Arc::clone(&snapshot);
                 let keys = Arc::clone(&keys);
-                s.spawn(move || {
+                handles.push(s.spawn(move || {
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
                     let key_count = keys.len();
                     let offset = t * ops_per_thread as usize;
                     for i in 0..ops_per_thread as usize {
+                        let op_start = Instant::now();
                         black_box(snapshot.get(keys[(offset + i) % key_count].as_str()));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -265,10 +497,18 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         );
 
         results.push(BenchResult {
-            name: format!("Parallel snapshot reads ({} threads, 500K lookups)", num_threads),
+            name: format!(
+                "Parallel snapshot reads ({} threads, 500K lookups)",
+                num_threads
+            ),
             ops: total_ops,
             elapsed,
             data_size: total_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: total_ops,
+            write_ops: 0,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -281,6 +521,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(3.0 / total_tests as f64, 20),
             "Persisted writes...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t3"))?;
         engine.create_table_with_capacity("bench", 10_000)?;
 
@@ -289,11 +530,16 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         let doc_size = doc.len() as u64;
         let keys = precompute_keys("key", count);
 
+        let mut lc = LatencyCollector::with_capacity(count as usize);
         let start = Instant::now();
         for key in &keys {
+            let op_start = Instant::now();
             engine.put("bench", key, &doc)?;
+            lc.record(op_start.elapsed().as_nanos() as u64);
         }
         let elapsed = start.elapsed();
+        lc.samples.sort_unstable();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -306,6 +552,11 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             ops: count,
             elapsed,
             data_size: count * doc_size,
+            latency: Some(lc),
+            read_ops: 0,
+            write_ops: count,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -318,6 +569,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(4.0 / total_tests as f64, 20),
             "Batch insert...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t4"))?;
         let count = 200_000u64;
         engine.create_table_with_capacity("bench", count as usize)?;
@@ -325,7 +577,6 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
 
         let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
         let doc_size = doc_bytes.len() as u64;
-        let doc: Arc<[u8]> = Arc::from(doc_bytes.into_boxed_slice());
 
         let ops_per_thread = count / num_threads as u64;
         let thread_keys: Vec<Vec<String>> = (0..num_threads)
@@ -337,21 +588,32 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             .collect();
 
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let table = &table;
-                let doc = &doc;
+                let raw = doc_bytes.as_slice();
                 let keys = &thread_keys[t];
-                s.spawn(move || {
-                    for key in keys {
-                        table.insert(key.clone(), Arc::clone(doc));
+                handles.push(s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
+                    for (i, key) in keys.iter().enumerate() {
+                        let op_start = Instant::now();
+                        table.insert(key.clone(), Arc::clone(&doc));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        // Single flush at the end
-        engine.put("bench", "__flush__", &[])?;
+        engine.compact("bench")?;
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -360,10 +622,18 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         );
 
         results.push(BenchResult {
-            name: format!("Parallel batch insert + flush ({} threads, 200K docs)", num_threads),
+            name: format!(
+                "Parallel batch insert + flush ({} threads, 200K docs)",
+                num_threads
+            ),
             ops: count,
             elapsed,
             data_size: count * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: count,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -376,6 +646,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(5.0 / total_tests as f64, 20),
             "Concurrent reads...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t5"))?;
         let data_count = 200_000u64;
         engine.create_table_with_capacity("bench", data_count as usize)?;
@@ -395,20 +666,31 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         let keys = Arc::new(keys);
 
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let snapshot = Arc::clone(&snapshot);
                 let keys = Arc::clone(&keys);
-                s.spawn(move || {
+                handles.push(s.spawn(move || {
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
                     let key_count = keys.len();
                     let offset = t * ops_per_thread as usize;
                     for i in 0..ops_per_thread as usize {
+                        let op_start = Instant::now();
                         black_box(snapshot.get(keys[(offset + i) % key_count].as_str()));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -425,6 +707,11 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             ops: total_ops,
             elapsed,
             data_size: total_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: total_ops,
+            write_ops: 0,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -437,6 +724,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(6.0 / total_tests as f64, 20),
             "Concurrent writes...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t6"))?;
 
         let ops_per_thread = 100_000u64;
@@ -446,7 +734,6 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
 
         let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
         let doc_size = doc_bytes.len() as u64;
-        let doc: Arc<[u8]> = Arc::from(doc_bytes.into_boxed_slice());
 
         let thread_keys: Vec<Vec<String>> = (0..num_threads)
             .map(|t| {
@@ -457,20 +744,32 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             .collect();
 
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let table = &table;
-                let doc = &doc;
+                let raw = doc_bytes.as_slice();
                 let keys = &thread_keys[t];
-                s.spawn(move || {
-                    for key in keys {
-                        table.insert(key.clone(), Arc::clone(doc));
+                handles.push(s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
+                    for (i, key) in keys.iter().enumerate() {
+                        let op_start = Instant::now();
+                        table.insert(key.clone(), Arc::clone(&doc));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
         let actual_ops = ops_per_thread * num_threads as u64;
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -487,6 +786,11 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             ops: actual_ops,
             elapsed,
             data_size: actual_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: actual_ops,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -499,6 +803,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(7.0 / total_tests as f64, 20),
             "Mixed read/write...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t7"))?;
         let ops_per_thread = 200_000u64 / num_threads as u64;
         let total_ops = ops_per_thread * num_threads as u64;
@@ -507,14 +812,12 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
 
         let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
         let doc_size = doc_bytes.len() as u64;
-        let doc: Arc<[u8]> = Arc::from(doc_bytes.into_boxed_slice());
+        let prefill_doc: Arc<[u8]> = Arc::from(doc_bytes.as_slice());
 
-        // Pre-fill with data all threads can read
         let prefill_keys = precompute_keys("pre", total_ops / 2);
-        fill_table(&table, &prefill_keys, &doc);
+        fill_table(&table, &prefill_keys, &prefill_doc);
         let prefill_keys = Arc::new(prefill_keys);
 
-        // Per-thread write keys
         let write_keys: Vec<Vec<String>> = (0..num_threads)
             .map(|t| {
                 (0..ops_per_thread)
@@ -523,26 +826,49 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             })
             .collect();
 
+        let total_reads = AtomicU64::new(0);
+        let total_writes = AtomicU64::new(0);
+
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let table = &table;
-                let doc = &doc;
+                let raw = doc_bytes.as_slice();
                 let wkeys = &write_keys[t];
                 let rkeys = Arc::clone(&prefill_keys);
-                s.spawn(move || {
+                let total_reads = &total_reads;
+                let total_writes = &total_writes;
+                handles.push(s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
                     let rkey_count = rkeys.len();
+                    let mut reads = 0u64;
+                    let mut writes = 0u64;
                     for i in 0..ops_per_thread as usize {
+                        let op_start = Instant::now();
                         if i % 3 == 0 {
-                            table.insert(wkeys[i].clone(), Arc::clone(doc));
+                            table.insert(wkeys[i].clone(), Arc::clone(&doc));
+                            writes += 1;
                         } else {
                             black_box(table.get(rkeys[i % rkey_count].as_str()));
+                            reads += 1;
+                        }
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
                         }
                     }
-                });
+                    total_reads.fetch_add(reads, Ordering::Relaxed);
+                    total_writes.fetch_add(writes, Ordering::Relaxed);
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -551,10 +877,18 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         );
 
         results.push(BenchResult {
-            name: format!("Parallel mixed 33%w/67%r ({} threads, 200K ops)", num_threads),
+            name: format!(
+                "Parallel mixed 33%w/67%r ({} threads, 200K ops)",
+                num_threads
+            ),
             ops: total_ops,
             elapsed,
             data_size: total_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: total_reads.load(Ordering::Relaxed),
+            write_ops: total_writes.load(Ordering::Relaxed),
+            mem_before,
+            mem_after,
         });
     }
 
@@ -567,31 +901,43 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(8.0 / total_tests as f64, 20),
             "JSON serde...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let ops_per_thread = 500_000u64 / num_threads as u64;
         let total_ops = ops_per_thread * num_threads as u64;
         let doc = Arc::new(make_doc(42));
-        let doc_bytes = serde_json::to_vec(&*doc).unwrap();
-        let single_doc_bytes = doc_bytes.len() as u64;
 
         let start = Instant::now();
-        let thread_bytes: Vec<u64> = std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for _t in 0..num_threads {
-                let doc = Arc::clone(&doc);
-                handles.push(s.spawn(move || {
-                    let mut bytes = 0u64;
-                    for _ in 0..ops_per_thread {
-                        let serialized = serde_json::to_vec(&*doc).unwrap();
-                        bytes += serialized.len() as u64;
-                        let _: Value = serde_json::from_slice(black_box(&serialized)).unwrap();
-                    }
-                    bytes
-                }));
-            }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+        let (thread_bytes, collectors): (Vec<u64>, Vec<LatencyCollector>) =
+            std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for _t in 0..num_threads {
+                    let doc = Arc::clone(&doc);
+                    handles.push(s.spawn(move || {
+                        let mut bytes = 0u64;
+                        let mut lc = LatencyCollector::with_capacity(
+                            (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                        );
+                        for i in 0..ops_per_thread {
+                            let op_start = Instant::now();
+                            let serialized = serde_json::to_vec(&*doc).unwrap();
+                            bytes += serialized.len() as u64;
+                            let _: Value =
+                                serde_json::from_slice(black_box(&serialized)).unwrap();
+                            if i % LATENCY_SAMPLE_RATE == 0 {
+                                lc.record(op_start.elapsed().as_nanos() as u64);
+                            }
+                        }
+                        (bytes, lc)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .unzip()
+            });
         let elapsed = start.elapsed();
         let total_bytes: u64 = thread_bytes.iter().sum();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -600,10 +946,18 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         );
 
         results.push(BenchResult {
-            name: format!("Parallel JSON serde ({} threads, 500K round-trips)", num_threads),
+            name: format!(
+                "Parallel JSON serde ({} threads, 500K round-trips)",
+                num_threads
+            ),
             ops: total_ops,
             elapsed,
             data_size: total_bytes,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: 0,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -616,15 +970,14 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(9.0 / total_tests as f64, 20),
             "Delete perf...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t9"))?;
         let count = 200_000u64;
         engine.create_table_with_capacity("bench", count as usize)?;
         let table = engine.table_handle("bench").unwrap();
 
         let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
-        let doc: Arc<[u8]> = Arc::from(doc_bytes.into_boxed_slice());
 
-        // Pre-compute keys per thread for both fill and delete
         let ops_per_thread = count / num_threads as u64;
         let thread_keys: Vec<Vec<String>> = (0..num_threads)
             .map(|t| {
@@ -638,30 +991,42 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         std::thread::scope(|s| {
             for t in 0..num_threads {
                 let table = &table;
-                let doc = &doc;
+                let raw = doc_bytes.as_slice();
                 let keys = &thread_keys[t];
                 s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
                     for key in keys {
-                        table.insert(key.clone(), Arc::clone(doc));
+                        table.insert(key.clone(), Arc::clone(&doc));
                     }
                 });
             }
         });
 
-        // Delete in parallel
+        // Delete in parallel with latency tracking
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let table = &table;
                 let keys = &thread_keys[t];
-                s.spawn(move || {
-                    for key in keys {
+                handles.push(s.spawn(move || {
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
+                    for (i, key) in keys.iter().enumerate() {
+                        let op_start = Instant::now();
                         table.remove(key.as_str());
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
@@ -674,6 +1039,11 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             ops: count,
             elapsed,
             data_size: 0,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: count,
+            mem_before,
+            mem_after,
         });
     }
 
@@ -686,6 +1056,7 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             progress_bar(10.0 / total_tests as f64, 20),
             "Large doc stress...".dimmed()
         );
+        let mem_before = get_rss_bytes();
         let engine = StorageEngine::open(&bench_dir.join("t10"))?;
         let count = 100_000u64;
         engine.create_table_with_capacity("bench", count as usize)?;
@@ -702,7 +1073,6 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         });
         let serialized = serde_json::to_vec(&large_doc).unwrap();
         let doc_size = serialized.len() as u64;
-        let doc: Arc<[u8]> = Arc::from(serialized.into_boxed_slice());
 
         let ops_per_thread = count / num_threads as u64;
         let thread_keys: Vec<Vec<String>> = (0..num_threads)
@@ -714,37 +1084,255 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
             .collect();
 
         let start = Instant::now();
-        std::thread::scope(|s| {
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
             for t in 0..num_threads {
                 let table = &table;
-                let doc = &doc;
+                let raw = serialized.as_slice();
                 let keys = &thread_keys[t];
-                s.spawn(move || {
-                    for key in keys {
-                        table.insert(key.clone(), Arc::clone(doc));
+                handles.push(s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
+                    for (i, key) in keys.iter().enumerate() {
+                        let op_start = Instant::now();
+                        table.insert(key.clone(), Arc::clone(&doc));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
                     }
-                });
+                    lc
+                }));
             }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
 
         println!(
             "\r  {} {}",
-            progress_bar(1.0, 20),
+            progress_bar(10.0 / total_tests as f64, 20),
             "Large doc stress ✓".green()
         );
 
         results.push(BenchResult {
-            name: format!("Parallel large doc writes ({} threads, 100K x ~{}KB)", num_threads, doc_size / 1024),
+            name: format!(
+                "Parallel large doc writes ({} threads, 100K x ~{}KB)",
+                num_threads,
+                doc_size / 1024
+            ),
             ops: count,
             elapsed,
             data_size: count * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: count,
+            mem_before,
+            mem_after,
+        });
+    }
+
+    // ─────────────────────────────────────────────────
+    // TEST 11: Scalability — single-thread vs N-thread write comparison
+    // ─────────────────────────────────────────────────
+    {
+        print!(
+            "  {} {}",
+            progress_bar(11.0 / total_tests as f64, 20),
+            "Scalability test...".dimmed()
+        );
+        let mem_before = get_rss_bytes();
+        let total_ops = 800_000u64;
+        let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
+        let doc_size = doc_bytes.len() as u64;
+
+        // Single-thread baseline (thread-local Arc, no shared refcount)
+        let engine_st = StorageEngine::open(&bench_dir.join("t11_st"))?;
+        engine_st.create_table_with_capacity("bench", total_ops as usize)?;
+        let table_st = engine_st.table_handle("bench").unwrap();
+        let keys_st = precompute_keys("st_key", total_ops);
+
+        let local_doc: Arc<[u8]> = Arc::from(doc_bytes.as_slice());
+        let start_st = Instant::now();
+        for key in &keys_st {
+            table_st.insert(key.clone(), Arc::clone(&local_doc));
+        }
+        let elapsed_st = start_st.elapsed();
+        let single_ops_sec = total_ops as f64 / elapsed_st.as_secs_f64();
+        drop(local_doc);
+
+        // Multi-thread (each thread gets its own Arc — no shared refcount contention)
+        let engine_mt = StorageEngine::open(&bench_dir.join("t11_mt"))?;
+        engine_mt.create_table_with_capacity("bench", total_ops as usize)?;
+        let table_mt = engine_mt.table_handle("bench").unwrap();
+
+        let ops_per_thread = total_ops / num_threads as u64;
+        let thread_keys: Vec<Vec<String>> = (0..num_threads)
+            .map(|t| {
+                (0..ops_per_thread)
+                    .map(|i| format!("mt_key_{}_{}", t, i))
+                    .collect()
+            })
+            .collect();
+
+        let start_mt = Instant::now();
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for t in 0..num_threads {
+                let table_mt = &table_mt;
+                let raw = doc_bytes.as_slice();
+                let keys = &thread_keys[t];
+                handles.push(s.spawn(move || {
+                    let doc: Arc<[u8]> = Arc::from(raw);
+                    let mut lc = LatencyCollector::with_capacity(
+                        (ops_per_thread / LATENCY_SAMPLE_RATE) as usize + 1,
+                    );
+                    for (i, key) in keys.iter().enumerate() {
+                        let op_start = Instant::now();
+                        table_mt.insert(key.clone(), Arc::clone(&doc));
+                        if i as u64 % LATENCY_SAMPLE_RATE == 0 {
+                            lc.record(op_start.elapsed().as_nanos() as u64);
+                        }
+                    }
+                    lc
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let elapsed_mt = start_mt.elapsed();
+        let multi_ops_sec = total_ops as f64 / elapsed_mt.as_secs_f64();
+        let scaling_efficiency =
+            (multi_ops_sec / single_ops_sec / num_threads as f64) * 100.0;
+        let mem_after = get_rss_bytes();
+
+        println!(
+            "\r  {} {}",
+            progress_bar(11.0 / total_tests as f64, 20),
+            "Scalability test ✓".green()
+        );
+
+        results.push(BenchResult {
+            name: format!(
+                "Scalability: 1→{} threads (efficiency {:.1}%, {:.1}x speedup)",
+                num_threads,
+                scaling_efficiency,
+                multi_ops_sec / single_ops_sec
+            ),
+            ops: total_ops,
+            elapsed: elapsed_mt,
+            data_size: total_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: 0,
+            write_ops: total_ops,
+            mem_before,
+            mem_after,
+        });
+    }
+
+    // ─────────────────────────────────────────────────
+    // TEST 12: Query response time — mixed lookups simulating real query patterns
+    // ─────────────────────────────────────────────────
+    {
+        print!(
+            "  {} {}",
+            progress_bar(12.0 / total_tests as f64, 20),
+            "Query response time...".dimmed()
+        );
+        let mem_before = get_rss_bytes();
+        let engine = StorageEngine::open(&bench_dir.join("t12"))?;
+        let data_count = 100_000u64;
+        engine.create_table_with_capacity("bench", data_count as usize)?;
+        let table = engine.table_handle("bench").unwrap();
+
+        let doc_bytes = serde_json::to_vec(&make_doc(0)).unwrap();
+        let doc_size = doc_bytes.len() as u64;
+        let doc: Arc<[u8]> = Arc::from(doc_bytes.into_boxed_slice());
+
+        let keys = precompute_keys("qkey", data_count);
+        fill_table(&table, &keys, &doc);
+        drop(table);
+
+        let snapshot = Arc::new(engine.snapshot("bench").unwrap());
+        let ops_per_thread = 100_000u64;
+        let total_ops = ops_per_thread * num_threads as u64;
+        let keys = Arc::new(keys);
+        let total_reads = AtomicU64::new(0);
+        let total_misses = AtomicU64::new(0);
+
+        let start = Instant::now();
+        let collectors: Vec<LatencyCollector> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for t in 0..num_threads {
+                let snapshot = Arc::clone(&snapshot);
+                let keys = Arc::clone(&keys);
+                let total_reads = &total_reads;
+                let total_misses = &total_misses;
+                handles.push(s.spawn(move || {
+                    // Record EVERY op for accurate percentile distribution
+                    let mut lc =
+                        LatencyCollector::with_capacity(ops_per_thread as usize);
+                    let key_count = keys.len();
+                    let mut reads = 0u64;
+                    let mut misses = 0u64;
+                    for i in 0..ops_per_thread as usize {
+                        let op_start = Instant::now();
+                        if i % 10 == 0 {
+                            // 10% miss lookups — query non-existent keys
+                            black_box(
+                                snapshot.get(&format!("missing_{}_{}", t, i)),
+                            );
+                            misses += 1;
+                        } else {
+                            // 90% hit lookups
+                            let idx = (t * ops_per_thread as usize + i) % key_count;
+                            black_box(snapshot.get(keys[idx].as_str()));
+                            reads += 1;
+                        }
+                        lc.record(op_start.elapsed().as_nanos() as u64);
+                    }
+                    total_reads.fetch_add(reads, Ordering::Relaxed);
+                    total_misses.fetch_add(misses, Ordering::Relaxed);
+                    lc
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let elapsed = start.elapsed();
+        let mem_after = get_rss_bytes();
+        let reads = total_reads.load(Ordering::Relaxed);
+        let misses = total_misses.load(Ordering::Relaxed);
+
+        println!(
+            "\r  {} {}",
+            progress_bar(1.0, 20),
+            "Query response time ✓".green()
+        );
+
+        results.push(BenchResult {
+            name: format!(
+                "Query response time ({} threads, {}K queries, {:.0}% hit rate)",
+                num_threads,
+                total_ops / 1000,
+                reads as f64 / total_ops as f64 * 100.0
+            ),
+            ops: total_ops,
+            elapsed,
+            data_size: total_ops * doc_size,
+            latency: Some(LatencyCollector::merge(collectors)),
+            read_ops: reads + misses,
+            write_ops: 0,
+            mem_before,
+            mem_after,
         });
     }
 
     // ═══════════════════════════════════════════════
     // RESULTS
     // ═══════════════════════════════════════════════
+    let global_elapsed = global_start.elapsed();
+    let final_rss = get_rss_bytes();
+
     println!();
     println!(
         "  {} {}",
@@ -762,13 +1350,30 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         print_result(result, i + 1, results.len());
     }
 
+    // ═══════════════════════════════════════════════
+    // AGGREGATE SUMMARY
+    // ═══════════════════════════════════════════════
     let total_ops: u64 = results.iter().map(|r| r.ops).sum();
     let total_time: f64 = results.iter().map(|r| r.elapsed.as_secs_f64()).sum();
     let total_data: u64 = results.iter().map(|r| r.data_size).sum();
+    let total_reads: u64 = results.iter().map(|r| r.read_ops).sum();
+    let total_writes: u64 = results.iter().map(|r| r.write_ops).sum();
     let peak_ops = results
         .iter()
         .map(|r| r.ops_per_sec())
         .fold(0.0f64, f64::max);
+
+    // Aggregate P99 across all tests with latency data
+    let all_latencies = LatencyCollector::merge(
+        results
+            .iter()
+            .filter_map(|r| {
+                r.latency.as_ref().map(|l| LatencyCollector {
+                    samples: l.samples.clone(),
+                })
+            })
+            .collect(),
+    );
 
     println!(
         "  {}",
@@ -785,23 +1390,13 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
         "──────────────────────────────────────────────────"
             .truecolor(60, 60, 80)
     );
+
+    // Throughput
     println!(
         "  {} {}  {}",
         "Total ops:".dimmed(),
         format_ops(total_ops as f64).bold().truecolor(120, 255, 120),
         format!("({})", total_ops).dimmed()
-    );
-    println!(
-        "  {} {}",
-        "Total time:".dimmed(),
-        format!("{:.2}s", total_time).bold().truecolor(255, 200, 100)
-    );
-    println!(
-        "  {} {}",
-        "Data processed:".dimmed(),
-        format!("{:.1} MB", total_data as f64 / (1024.0 * 1024.0))
-            .bold()
-            .truecolor(180, 180, 255)
     );
     println!(
         "  {} {} ops/sec",
@@ -810,10 +1405,199 @@ pub fn run_benchmark(data_dir: &Path) -> io::Result<()> {
     );
     println!(
         "  {} {}",
+        "Data processed:".dimmed(),
+        format!("{:.1} MB", total_data as f64 / (1024.0 * 1024.0))
+            .bold()
+            .truecolor(180, 180, 255)
+    );
+
+    println!(
+        "  {}",
+        "──────────────────────────────────────────────────"
+            .truecolor(60, 60, 80)
+    );
+
+    // Latency percentiles (aggregate)
+    println!(
+        "  {} {}",
+        "⏱".truecolor(255, 200, 50),
+        "LATENCY DISTRIBUTION (aggregate)"
+            .bold()
+            .truecolor(120, 80, 255)
+    );
+    println!(
+        "  {} {}",
+        "  P50:".dimmed(),
+        format_latency_u64(all_latencies.p50())
+            .bold()
+            .truecolor(100, 255, 200)
+    );
+    println!(
+        "  {} {}",
+        "  P95:".dimmed(),
+        format_latency_u64(all_latencies.p95())
+            .bold()
+            .truecolor(200, 255, 100)
+    );
+    println!(
+        "  {} {}",
+        "  P99:".dimmed(),
+        format_latency_u64(all_latencies.p99())
+            .bold()
+            .truecolor(255, 200, 100)
+    );
+    println!(
+        "  {} {}",
+        "P99.9:".dimmed(),
+        format_latency_u64(all_latencies.p999())
+            .bold()
+            .truecolor(255, 120, 80)
+    );
+    println!(
+        "  {}  {}",
+        "  Min:".dimmed(),
+        format_latency_u64(all_latencies.min()).dimmed()
+    );
+    println!(
+        "  {}  {}",
+        "  Max:".dimmed(),
+        format_latency_u64(all_latencies.max()).dimmed()
+    );
+    println!(
+        "  {}  {}",
+        "  Avg:".dimmed(),
+        format_latency(all_latencies.avg()).dimmed()
+    );
+
+    println!(
+        "  {}",
+        "──────────────────────────────────────────────────"
+            .truecolor(60, 60, 80)
+    );
+
+    // Read/write ratio
+    println!(
+        "  {} {}",
+        "📊".truecolor(255, 200, 50),
+        "READ/WRITE RATIO (aggregate)"
+            .bold()
+            .truecolor(120, 80, 255)
+    );
+    let rw_total = (total_reads + total_writes) as f64;
+    if rw_total > 0.0 {
+        let r_pct = total_reads as f64 / rw_total * 100.0;
+        let w_pct = total_writes as f64 / rw_total * 100.0;
+        println!(
+            "  {} reads  {} writes",
+            format!("{:.1}%", r_pct).bold().truecolor(100, 200, 255),
+            format!("{:.1}%", w_pct).bold().truecolor(255, 150, 100),
+        );
+        println!(
+            "  {} reads: {}  writes: {}",
+            "↳".dimmed(),
+            total_reads.to_string().dimmed(),
+            total_writes.to_string().dimmed(),
+        );
+    }
+
+    println!(
+        "  {}",
+        "──────────────────────────────────────────────────"
+            .truecolor(60, 60, 80)
+    );
+
+    // Resource utilization
+    println!(
+        "  {} {}",
+        "🖥".truecolor(255, 200, 50),
+        "RESOURCE UTILIZATION".bold().truecolor(120, 80, 255)
+    );
+    println!(
+        "  {} {}",
         "CPU threads:".dimmed(),
         num_threads.to_string().bold()
     );
+    println!(
+        "  {} {}",
+        "Initial RSS:".dimmed(),
+        format_bytes(initial_rss).bold()
+    );
+    println!(
+        "  {} {}",
+        "Final RSS:  ".dimmed(),
+        format_bytes(final_rss).bold()
+    );
+    if final_rss > initial_rss {
+        println!(
+            "  {} {}",
+            "Δ Memory:   ".dimmed(),
+            format!(
+                "+{:.1} MB",
+                (final_rss - initial_rss) as f64 / 1_048_576.0
+            )
+            .bold()
+            .truecolor(255, 200, 100)
+        );
+    }
+    println!(
+        "  {} {}",
+        "Wall clock: ".dimmed(),
+        format!("{:.2}s", global_elapsed.as_secs_f64())
+            .bold()
+            .truecolor(255, 200, 100)
+    );
+    println!(
+        "  {} {}",
+        "Sum of test:".dimmed(),
+        format!("{:.2}s", total_time).bold().truecolor(255, 200, 100)
+    );
+
+    println!(
+        "  {}",
+        "──────────────────────────────────────────────────"
+            .truecolor(60, 60, 80)
+    );
+
+    // Scalability summary
+    println!(
+        "  {} {}",
+        "📈".truecolor(255, 200, 50),
+        "SCALABILITY".bold().truecolor(120, 80, 255)
+    );
+    if let Some(scale_result) = results.iter().find(|r| r.name.starts_with("Scalability")) {
+        println!(
+            "  {} {}",
+            "Result:".dimmed(),
+            scale_result.name.bold().truecolor(120, 255, 120)
+        );
+    }
+    let write_tests: Vec<&BenchResult> = results.iter().filter(|r| r.write_ops > 0).collect();
+    let read_tests: Vec<&BenchResult> = results.iter().filter(|r| r.read_ops > 0).collect();
+    if !write_tests.is_empty() {
+        let avg_write_ops: f64 =
+            write_tests.iter().map(|r| r.ops_per_sec()).sum::<f64>() / write_tests.len() as f64;
+        println!(
+            "  {} {} ops/sec",
+            "Avg write throughput:".dimmed(),
+            format_ops(avg_write_ops).bold().truecolor(255, 150, 100)
+        );
+    }
+    if !read_tests.is_empty() {
+        let avg_read_ops: f64 =
+            read_tests.iter().map(|r| r.ops_per_sec()).sum::<f64>() / read_tests.len() as f64;
+        println!(
+            "  {} {} ops/sec",
+            "Avg read throughput: ".dimmed(),
+            format_ops(avg_read_ops).bold().truecolor(100, 200, 255)
+        );
+    }
+
     println!();
+    println!(
+        "  {}",
+        "══════════════════════════════════════════════════"
+            .truecolor(60, 60, 80)
+    );
 
     let score = ((peak_ops / 1000.0) + (total_ops as f64 / total_time / 1000.0)) as u64;
     println!(
