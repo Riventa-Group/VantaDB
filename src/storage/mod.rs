@@ -1,2 +1,2 @@
 pub mod engine;
-pub use engine::{ReadSnapshot, StorageEngine};
+pub use engine::{ReadSnapshot, StorageEngine, Table};

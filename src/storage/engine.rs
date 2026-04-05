@@ -13,12 +13,15 @@ use std::sync::Arc;
 /// near-linear scaling up to 64+ cores.
 const TABLE_SHARD_COUNT: usize = 256;
 
-/// WAL buffer size — 64KB reduces syscalls while keeping memory modest.
-const WAL_BUF_SIZE: usize = 64 * 1024;
+/// WAL buffer size — 256KB reduces syscalls while keeping memory modest.
+const WAL_BUF_SIZE: usize = 256 * 1024;
 
 // WAL binary format markers
 const WAL_OP_PUT: u8 = 0x01;
 const WAL_OP_DELETE: u8 = 0x02;
+
+/// Type alias for a single table: 256-shard DashMap with ahash.
+pub type Table = DashMap<String, Arc<[u8]>, RandomState>;
 
 /// An immutable, lock-free snapshot of a table for maximum read throughput.
 /// No locks, no atomics, no contention — just pure HashMap::get() with ahash.
@@ -37,18 +40,28 @@ impl ReadSnapshot {
     }
 }
 
+#[inline(always)]
+fn new_table(capacity: usize) -> Table {
+    DashMap::with_capacity_and_hasher_and_shard_amount(capacity, RandomState::new(), TABLE_SHARD_COUNT)
+}
+
+#[inline(always)]
+fn new_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V, RandomState> {
+    DashMap::with_hasher(RandomState::new())
+}
+
 /// Core storage engine: 256-shard DashMap + WAL-based persistence.
 ///
 /// Architecture:
-/// - 256-shard DashMap per table: near-linear write scaling across cores
+/// - 256-shard DashMap per table with ahash: near-linear write scaling across cores
 /// - Write-Ahead Log (WAL): O(1) append per write instead of O(n) full-table serialization
 /// - Arc<[u8]> values: zero-copy reads via refcount bump (~5ns vs ~50ns memcpy)
 /// - Deferred compaction: full snapshot written on compact(), not every put()
 #[derive(Clone)]
 pub struct StorageEngine {
     base_path: PathBuf,
-    tables: Arc<DashMap<String, Arc<DashMap<String, Arc<[u8]>>>>>,
-    wal_writers: Arc<DashMap<String, Arc<Mutex<BufWriter<File>>>>>,
+    tables: Arc<DashMap<String, Arc<Table>, RandomState>>,
+    wal_writers: Arc<DashMap<String, Arc<Mutex<BufWriter<File>>>, RandomState>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,8 +74,8 @@ impl StorageEngine {
         fs::create_dir_all(base_path)?;
         let engine = Self {
             base_path: base_path.to_path_buf(),
-            tables: Arc::new(DashMap::new()),
-            wal_writers: Arc::new(DashMap::new()),
+            tables: Arc::new(new_map()),
+            wal_writers: Arc::new(new_map()),
         };
         engine.load_all()?;
         Ok(engine)
@@ -93,7 +106,7 @@ impl StorageEngine {
                 if let Ok(data) = fs::read(&path) {
                     if let Ok(table_file) = bincode::deserialize::<TableFile>(&data) {
                         let cap = table_file.entries.len().max(TABLE_SHARD_COUNT);
-                        let map = DashMap::with_capacity_and_shard_amount(cap, TABLE_SHARD_COUNT);
+                        let map = new_table(cap);
                         for (k, v) in table_file.entries {
                             map.insert(k, Arc::from(v.into_boxed_slice()));
                         }
@@ -118,8 +131,7 @@ impl StorageEngine {
                     .unwrap_or("")
                     .to_string();
                 if !self.tables.contains_key(&table_name) {
-                    let map =
-                        DashMap::with_capacity_and_shard_amount(TABLE_SHARD_COUNT, TABLE_SHARD_COUNT);
+                    let map = new_table(TABLE_SHARD_COUNT);
                     Self::replay_wal(&map, &path)?;
                     self.tables.insert(table_name, Arc::new(map));
                 }
@@ -128,7 +140,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn replay_wal(map: &DashMap<String, Arc<[u8]>>, path: &Path) -> io::Result<()> {
+    fn replay_wal(map: &Table, path: &Path) -> io::Result<()> {
         let data = fs::read(path)?;
         let len = data.len();
         let mut pos = 0;
@@ -183,6 +195,7 @@ impl StorageEngine {
         Ok(())
     }
 
+    #[inline(always)]
     fn get_wal_writer(&self, table: &str) -> io::Result<Arc<Mutex<BufWriter<File>>>> {
         if let Some(w) = self.wal_writers.get(table) {
             return Ok(Arc::clone(w.value()));
@@ -197,7 +210,7 @@ impl StorageEngine {
         Ok(writer)
     }
 
-    #[inline]
+    #[inline(always)]
     fn wal_append_put(&self, table: &str, key: &str, value: &[u8]) -> io::Result<()> {
         let writer = self.get_wal_writer(table)?;
         let mut w = writer.lock();
@@ -210,7 +223,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn wal_append_delete(&self, table: &str, key: &str) -> io::Result<()> {
         let writer = self.get_wal_writer(table)?;
         let mut w = writer.lock();
@@ -246,17 +259,19 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn get_or_create_table(&self, table: &str) -> Arc<DashMap<String, Arc<[u8]>>> {
+    #[inline(always)]
+    fn get_or_create_table(&self, table: &str) -> Arc<Table> {
         if let Some(t) = self.tables.get(table) {
             Arc::clone(t.value())
         } else {
-            let map = Arc::new(DashMap::with_capacity_and_shard_amount(64, TABLE_SHARD_COUNT));
+            let map = Arc::new(new_table(64));
             self.tables.insert(table.to_string(), Arc::clone(&map));
             map
         }
     }
 
     /// Insert with WAL persistence (append-only, no full flush).
+    #[inline(always)]
     pub fn put(&self, table: &str, key: &str, value: &[u8]) -> io::Result<()> {
         let t = self.get_or_create_table(table);
         t.insert(key.to_string(), Arc::from(value));
@@ -264,6 +279,7 @@ impl StorageEngine {
     }
 
     /// Zero-copy read: returns Arc refcount bump instead of memcpy.
+    #[inline(always)]
     pub fn get(&self, table: &str, key: &str) -> Option<Arc<[u8]>> {
         let t = self.tables.get(table)?;
         t.get(key).map(|v| Arc::clone(v.value()))
@@ -296,7 +312,7 @@ impl StorageEngine {
         if !self.tables.contains_key(table) {
             self.tables.insert(
                 table.to_string(),
-                Arc::new(DashMap::with_capacity_and_shard_amount(64, TABLE_SHARD_COUNT)),
+                Arc::new(new_table(64)),
             );
         }
         self.compact(table)
@@ -307,10 +323,7 @@ impl StorageEngine {
         if !self.tables.contains_key(table) {
             self.tables.insert(
                 table.to_string(),
-                Arc::new(DashMap::with_capacity_and_shard_amount(
-                    capacity,
-                    TABLE_SHARD_COUNT,
-                )),
+                Arc::new(new_table(capacity)),
             );
         }
         self.compact(table)
@@ -346,7 +359,7 @@ impl StorageEngine {
     pub fn snapshot(&self, table: &str) -> Option<ReadSnapshot> {
         let t = self.tables.get(table)?;
         let mut data =
-            HashMap::with_capacity_and_hasher(t.len(), RandomState::default());
+            HashMap::with_capacity_and_hasher(t.len(), RandomState::new());
         for entry in t.iter() {
             data.insert(entry.key().clone(), Arc::clone(entry.value()));
         }
@@ -355,7 +368,7 @@ impl StorageEngine {
 
     /// Get a direct handle to a table's 256-shard DashMap.
     #[inline(always)]
-    pub fn table_handle(&self, table: &str) -> Option<Arc<DashMap<String, Arc<[u8]>>>> {
+    pub fn table_handle(&self, table: &str) -> Option<Arc<Table>> {
         self.tables.get(table).map(|t| Arc::clone(t.value()))
     }
 
