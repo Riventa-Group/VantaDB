@@ -1,0 +1,151 @@
+mod auth;
+mod bench;
+mod cli;
+mod db;
+mod storage;
+
+use clap::Parser;
+use colored::*;
+use std::process;
+
+use cli::Shell;
+
+#[derive(Parser)]
+#[command(
+    name = "vantadb",
+    about = "VantaDB — Next-Gen Database Engine",
+    version = "0.1.0",
+    author = "Riventa Group"
+)]
+struct Cli {
+    /// Start an interactive session (authenticate and enter shell)
+    #[arg(long)]
+    login: bool,
+
+    /// Show server status
+    #[arg(long)]
+    status: bool,
+
+    /// Run full benchmark suite
+    #[arg(long)]
+    benchmark: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    if cli.benchmark {
+        run_benchmark();
+    } else if cli.status {
+        run_status();
+    } else {
+        run_login();
+    }
+}
+
+fn run_login() {
+    Shell::print_banner();
+
+    let (_engine, auth, db_manager) = match Shell::init() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to initialize: {}",
+                "✗".red().bold(),
+                e.to_string().red()
+            );
+            process::exit(1);
+        }
+    };
+
+    let user = match Shell::login(&auth) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Auth error: {}",
+                "✗".red().bold(),
+                e.to_string().red()
+            );
+            process::exit(1);
+        }
+    };
+
+    let mut shell = Shell::new(user, auth, db_manager);
+    if let Err(e) = shell.run() {
+        eprintln!(
+            "  {} Shell error: {}",
+            "✗".red().bold(),
+            e.to_string().red()
+        );
+        process::exit(1);
+    }
+}
+
+fn run_status() {
+    Shell::print_banner();
+
+    let (_engine, auth, db_manager) = match Shell::init() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to initialize: {}",
+                "✗".red().bold(),
+                e.to_string().red()
+            );
+            process::exit(1);
+        }
+    };
+
+    let dbs = db_manager.list_databases();
+    let users = auth.list_users();
+
+    println!(
+        "  {}",
+        "VANTADB STATUS".bold().truecolor(120, 80, 255)
+    );
+    println!(
+        "  {}",
+        "─────────────────────────────".truecolor(60, 60, 80)
+    );
+    println!(
+        "  {} {}",
+        "Version:".dimmed(),
+        "0.1.0".truecolor(120, 200, 120)
+    );
+    println!(
+        "  {} {}",
+        "Data dir:".dimmed(),
+        Shell::data_dir()
+            .display()
+            .to_string()
+            .truecolor(200, 200, 220)
+    );
+    println!(
+        "  {} {}",
+        "Databases:".dimmed(),
+        dbs.len().to_string().bold()
+    );
+    println!(
+        "  {} {}",
+        "Users:".dimmed(),
+        users.len().to_string().bold()
+    );
+    println!();
+}
+
+fn run_benchmark() {
+    Shell::print_banner();
+
+    let data_dir = Shell::data_dir();
+    if let Err(e) = bench::run_benchmark(&data_dir) {
+        eprintln!(
+            "  {} Benchmark failed: {}",
+            "✗".red().bold(),
+            e.to_string().red()
+        );
+        process::exit(1);
+    }
+}
