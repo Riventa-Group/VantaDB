@@ -1,0 +1,180 @@
+syntax = "proto3";
+package vantadb;
+
+// ─── Authentication Service ──────────────────
+// Authenticate is callable without a token.
+// All other RPCs require a valid session token in the
+// "authorization" metadata key (Bearer <token>).
+
+service VantaAuth {
+  rpc Authenticate (AuthRequest)       returns (AuthResponse);
+  rpc CreateUser   (CreateUserRequest) returns (StatusResponse);
+  rpc DeleteUser   (DeleteUserRequest) returns (StatusResponse);
+  rpc SetPassword  (SetPasswordRequest) returns (StatusResponse);
+  rpc ListUsers    (Empty)             returns (ListUsersResponse);
+  rpc GetUser      (GetUserRequest)    returns (GetUserResponse);
+}
+
+// ─── Database Service ────────────────────────
+// All RPCs require a valid session token.
+
+service VantaDb {
+  // Database operations
+  rpc CreateDatabase   (DatabaseRequest)   returns (StatusResponse);
+  rpc DropDatabase     (DatabaseRequest)   returns (StatusResponse);
+  rpc ListDatabases    (Empty)             returns (ListDatabasesResponse);
+
+  // Collection operations
+  rpc CreateCollection (CollectionRequest) returns (StatusResponse);
+  rpc DropCollection   (CollectionRequest) returns (StatusResponse);
+  rpc ListCollections  (DatabaseRequest)   returns (ListCollectionsResponse);
+
+  // Document operations
+  rpc Insert     (InsertRequest)     returns (InsertResponse);
+  rpc FindById   (FindByIdRequest)   returns (DocumentResponse);
+  rpc FindAll    (FindAllRequest)    returns (DocumentsResponse);
+  rpc FindWhere  (FindWhereRequest)  returns (DocumentsResponse);
+  rpc DeleteById (DeleteByIdRequest) returns (DeleteResponse);
+  rpc Count      (CountRequest)      returns (CountResponse);
+}
+
+// ─── Common ──────────────────────────────────
+
+message Empty {}
+
+message StatusResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ─── Auth messages ───────────────────────────
+
+message AuthRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthResponse {
+  bool   success = 1;
+  string token   = 2;
+  string role    = 3;
+  string error   = 4;
+}
+
+message CreateUserRequest {
+  string          username  = 1;
+  string          password  = 2;
+  string          role      = 3;
+  repeated string databases = 4;
+}
+
+message DeleteUserRequest {
+  string username = 1;
+}
+
+message SetPasswordRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message GetUserRequest {
+  string username = 1;
+}
+
+message GetUserResponse {
+  bool            found      = 1;
+  string          username   = 2;
+  string          role       = 3;
+  string          created_at = 4;
+  repeated string databases  = 5;
+}
+
+message ListUsersResponse {
+  repeated string usernames = 1;
+}
+
+// ─── Database messages ───────────────────────
+
+message DatabaseRequest {
+  string database = 1;
+}
+
+message ListDatabasesResponse {
+  repeated string databases = 1;
+}
+
+// ─── Collection messages ─────────────────────
+
+message CollectionRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message ListCollectionsResponse {
+  repeated string collections = 1;
+}
+
+// ─── Document messages ───────────────────────
+
+message InsertRequest {
+  string database      = 1;
+  string collection    = 2;
+  string document_json = 3;
+}
+
+message InsertResponse {
+  bool   success = 1;
+  string id      = 2;
+  string error   = 3;
+}
+
+message FindByIdRequest {
+  string database   = 1;
+  string collection = 2;
+  string id         = 3;
+}
+
+message DocumentResponse {
+  bool   found         = 1;
+  string document_json = 2;
+  string error         = 3;
+}
+
+message FindAllRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message FindWhereRequest {
+  string database   = 1;
+  string collection = 2;
+  string field      = 3;
+  string value_json = 4;
+}
+
+message DocumentsResponse {
+  repeated string documents_json = 1;
+  string          error          = 2;
+}
+
+message DeleteByIdRequest {
+  string database   = 1;
+  string collection = 2;
+  string id         = 3;
+}
+
+message DeleteResponse {
+  bool   success = 1;
+  bool   found   = 2;
+  string error   = 3;
+}
+
+message CountRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message CountResponse {
+  uint64 count = 1;
+  string error = 2;
+}

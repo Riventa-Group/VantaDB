@@ -5,6 +5,7 @@ mod auth;
 mod bench;
 mod cli;
 mod db;
+mod server;
 mod storage;
 
 use clap::Parser;
@@ -32,6 +33,14 @@ struct Cli {
     /// Run full benchmark suite
     #[arg(long)]
     benchmark: bool,
+
+    /// Start the gRPC server
+    #[arg(long)]
+    serve: bool,
+
+    /// Port for the gRPC server
+    #[arg(long, default_value = "5432")]
+    port: u16,
 }
 
 fn main() {
@@ -41,6 +50,8 @@ fn main() {
         run_benchmark();
     } else if cli.status {
         run_status();
+    } else if cli.serve {
+        run_server(cli.port);
     } else {
         run_login();
     }
@@ -137,6 +148,41 @@ fn run_status() {
         users.len().to_string().bold()
     );
     println!();
+}
+
+fn run_server(port: u16) {
+    Shell::print_banner();
+
+    let (_engine, auth, db_manager) = match Shell::init() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to initialize: {}",
+                "✗".red().bold(),
+                e.to_string().red()
+            );
+            process::exit(1);
+        }
+    };
+
+    println!(
+        "  {} Starting gRPC server on port {}...",
+        "→".truecolor(120, 80, 255),
+        port.to_string().bold()
+    );
+    println!();
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    rt.block_on(async move {
+        if let Err(e) = server::start(auth, db_manager, port).await {
+            eprintln!(
+                "  {} Server error: {}",
+                "✗".red().bold(),
+                e.to_string().red()
+            );
+            process::exit(1);
+        }
+    });
 }
 
 fn run_benchmark() {
