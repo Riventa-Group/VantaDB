@@ -32,6 +32,7 @@ mimalloc = { version = "0.1", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tonic = "0.12"
 prost = "0.13"
+regex = "1"
 
 [build-dependencies]
 tonic-build = "0.12"

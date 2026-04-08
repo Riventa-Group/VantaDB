@@ -5,6 +5,7 @@ mod auth;
 mod bench;
 mod cli;
 mod db;
+mod selfcheck;
 mod server;
 mod storage;
 
@@ -41,12 +42,26 @@ struct Cli {
     /// Port for the gRPC server
     #[arg(long, default_value = "5432")]
     port: u16,
+
+    /// Run self-check: connect to a running server and test every feature via gRPC
+    #[arg(long = "self-check")]
+    self_check: bool,
+
+    /// Username for self-check authentication
+    #[arg(long)]
+    user: Option<String>,
+
+    /// Password for self-check authentication
+    #[arg(long)]
+    password: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    if cli.benchmark {
+    if cli.self_check {
+        run_self_check(cli.user, cli.password, cli.port);
+    } else if cli.benchmark {
         run_benchmark();
     } else if cli.status {
         run_status();
@@ -180,6 +195,39 @@ fn run_server(port: u16) {
                 "✗".red().bold(),
                 e.to_string().red()
             );
+            process::exit(1);
+        }
+    });
+}
+
+fn run_self_check(user: Option<String>, password: Option<String>, port: u16) {
+    let user = match user {
+        Some(u) => u,
+        None => {
+            eprintln!(
+                "  {} --user is required for self-check",
+                "✗".red().bold()
+            );
+            process::exit(1);
+        }
+    };
+    let password = match password {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "  {} --password is required for self-check",
+                "✗".red().bold()
+            );
+            process::exit(1);
+        }
+    };
+
+    Shell::print_banner();
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    rt.block_on(async move {
+        let success = selfcheck::run(port, &user, &password).await;
+        if !success {
             process::exit(1);
         }
     });

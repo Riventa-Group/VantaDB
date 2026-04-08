@@ -24,6 +24,7 @@ pub struct Shell {
     pub auth: AuthManager,
     pub db_manager: DatabaseManager,
     pub current_db: Option<String>,
+    pub current_tx: Option<String>,
     _data_dir: PathBuf,
 }
 
@@ -159,6 +160,7 @@ impl Shell {
             auth,
             db_manager,
             current_db: None,
+            current_tx: None,
             _data_dir: Self::data_dir(),
         }
     }

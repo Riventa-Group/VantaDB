@@ -29,13 +29,41 @@ service VantaDb {
   rpc DropCollection   (CollectionRequest) returns (StatusResponse);
   rpc ListCollections  (DatabaseRequest)   returns (ListCollectionsResponse);
 
-  // Document operations
+  // Document CRUD
   rpc Insert     (InsertRequest)     returns (InsertResponse);
   rpc FindById   (FindByIdRequest)   returns (DocumentResponse);
   rpc FindAll    (FindAllRequest)    returns (DocumentsResponse);
   rpc FindWhere  (FindWhereRequest)  returns (DocumentsResponse);
   rpc DeleteById (DeleteByIdRequest) returns (DeleteResponse);
   rpc Count      (CountRequest)      returns (CountResponse);
+
+  // Update operations
+  rpc Update      (UpdateRequest)      returns (UpdateResponse);
+  rpc UpdateWhere (UpdateWhereRequest)  returns (UpdateResponse);
+
+  // Rich query (filter engine)
+  rpc Query (QueryRequest) returns (DocumentsResponse);
+
+  // Aggregation pipeline
+  rpc Aggregate (AggregateRequest) returns (AggregateResponse);
+
+  // Index management
+  rpc CreateIndex (IndexRequest)      returns (StatusResponse);
+  rpc DropIndex   (IndexRequest)      returns (StatusResponse);
+  rpc ListIndexes (ListIndexesRequest) returns (ListIndexesResponse);
+
+  // Schema validation
+  rpc SetSchema  (SetSchemaRequest)  returns (StatusResponse);
+  rpc GetSchema  (GetSchemaRequest)  returns (GetSchemaResponse);
+  rpc DropSchema (GetSchemaRequest)  returns (StatusResponse);
+
+  // Transactions
+  rpc BeginTx    (Empty)            returns (TxResponse);
+  rpc CommitTx   (TxRequest)        returns (StatusResponse);
+  rpc RollbackTx (TxRequest)        returns (StatusResponse);
+  rpc TxInsert   (TxInsertRequest)  returns (StatusResponse);
+  rpc TxUpdate   (TxUpdateRequest)  returns (StatusResponse);
+  rpc TxDelete   (TxDeleteRequest)  returns (StatusResponse);
 }
 
 // ─── Common ──────────────────────────────────
@@ -114,6 +142,18 @@ message ListCollectionsResponse {
   repeated string collections = 1;
 }
 
+// ─── Query options ───────────────────────────
+
+message PaginationOptions {
+  uint32 page      = 1;  // 1-indexed page number (0 = no pagination)
+  uint32 page_size = 2;  // items per page (default 50)
+}
+
+message SortOptions {
+  string field      = 1;  // field name to sort by
+  bool   descending = 2;  // true = descending, false = ascending
+}
+
 // ─── Document messages ───────────────────────
 
 message InsertRequest {
@@ -141,20 +181,25 @@ message DocumentResponse {
 }
 
 message FindAllRequest {
-  string database   = 1;
-  string collection = 2;
+  string database              = 1;
+  string collection            = 2;
+  PaginationOptions pagination = 3;
+  SortOptions       sort       = 4;
 }
 
 message FindWhereRequest {
-  string database   = 1;
-  string collection = 2;
-  string field      = 3;
-  string value_json = 4;
+  string database              = 1;
+  string collection            = 2;
+  string field                 = 3;
+  string value_json            = 4;
+  PaginationOptions pagination = 5;
+  SortOptions       sort       = 6;
 }
 
 message DocumentsResponse {
   repeated string documents_json = 1;
   string          error          = 2;
+  uint64          total_count    = 3;
 }
 
 message DeleteByIdRequest {
@@ -177,4 +222,122 @@ message CountRequest {
 message CountResponse {
   uint64 count = 1;
   string error = 2;
+}
+
+// ─── Update messages ─────────────────────────
+
+message UpdateRequest {
+  string database   = 1;
+  string collection = 2;
+  string id         = 3;
+  string patch_json = 4;  // JSON patch: plain object or with $set/$unset/$inc/$push/$pull
+}
+
+message UpdateWhereRequest {
+  string database    = 1;
+  string collection  = 2;
+  string filter_json = 3;  // JSON filter expression
+  string patch_json  = 4;  // JSON patch
+}
+
+message UpdateResponse {
+  bool   success        = 1;
+  uint64 modified_count = 2;
+  string error          = 3;
+}
+
+// ─── Rich query messages ─────────────────────
+
+message QueryRequest {
+  string database              = 1;
+  string collection            = 2;
+  string filter_json           = 3;  // MongoDB-style filter: {"age": {"$gt": 25}}
+  PaginationOptions pagination = 4;
+  SortOptions       sort       = 5;
+}
+
+// ─── Aggregation messages ────────────────────
+
+message AggregateRequest {
+  string database      = 1;
+  string collection    = 2;
+  string pipeline_json = 3;  // JSON array of pipeline stages
+}
+
+message AggregateResponse {
+  repeated string results_json = 1;
+  string          error        = 2;
+}
+
+// ─── Index messages ──────────────────────────
+
+message IndexRequest {
+  string database   = 1;
+  string collection = 2;
+  string field      = 3;
+  bool   unique     = 4;
+}
+
+message ListIndexesRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message ListIndexesResponse {
+  repeated IndexInfo indexes = 1;
+}
+
+message IndexInfo {
+  string field  = 1;
+  bool   unique = 2;
+}
+
+// ─── Schema messages ─────────────────────────
+
+message SetSchemaRequest {
+  string database    = 1;
+  string collection  = 2;
+  string schema_json = 3;  // CollectionSchema as JSON
+}
+
+message GetSchemaRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message GetSchemaResponse {
+  bool   found       = 1;
+  string schema_json = 2;
+}
+
+// ─── Transaction messages ────────────────────
+
+message TxResponse {
+  string tx_id = 1;
+}
+
+message TxRequest {
+  string tx_id = 1;
+}
+
+message TxInsertRequest {
+  string tx_id         = 1;
+  string database      = 2;
+  string collection    = 3;
+  string document_json = 4;
+}
+
+message TxUpdateRequest {
+  string tx_id      = 1;
+  string database   = 2;
+  string collection = 3;
+  string id         = 4;
+  string patch_json = 5;
+}
+
+message TxDeleteRequest {
+  string tx_id      = 1;
+  string database   = 2;
+  string collection = 3;
+  string id         = 4;
 }

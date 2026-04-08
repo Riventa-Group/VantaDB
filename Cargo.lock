@@ -1700,6 +1700,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "rand",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
