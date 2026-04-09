@@ -941,6 +941,7 @@ impl DatabaseManager {
     /// Read a document within a transaction.
     /// Checks workspace first (read-your-own-writes), then falls back
     /// to the MVCC snapshot at the transaction's start version.
+    /// Records the read in the transaction's read_set for commit-time validation.
     pub fn tx_find_by_id(
         &self,
         tx_id: &str,
@@ -965,6 +966,10 @@ impl DatabaseManager {
         let snap_version = self.tx_manager.get_snapshot_version(tx_id)?;
         let store = self.db_engine(db)?;
         let snap = crate::storage::Snapshot { version: snap_version };
+
+        // Record this read in the read_set for serializable validation
+        self.tx_manager.record_read(tx_id, collection, id, snap_version)?;
+
         match store.get_at(collection, id, snap) {
             Some(data) => {
                 let doc: Value = serde_json::from_slice(&data)?;
@@ -978,8 +983,38 @@ impl DatabaseManager {
         let tx = self.tx_manager.take(tx_id)?;
         let commit_txn_id = tx.id;
 
+        // Read-set validation (serializable snapshot isolation):
+        // For each key we read, check if a newer version was committed
+        // since our snapshot. If so, another transaction wrote to a key
+        // we depend on — abort to prevent serialization anomaly.
+        for (collection, doc_id, version_read) in &tx.read_set {
+            // We need to find which database this collection belongs to.
+            // Scan ops to find the database (all ops in a tx typically
+            // share the same database).
+            let db = tx.ops.iter().find_map(|op| match op {
+                TransactionOp::Insert { db, .. }
+                | TransactionOp::Update { db, .. }
+                | TransactionOp::Delete { db, .. } => Some(db.as_str()),
+            });
+            if let Some(db) = db {
+                if let Ok(store) = self.db_engine(db) {
+                    if store.has_write_after(collection, doc_id, *version_read) {
+                        // Conflict: another transaction committed a write
+                        // to a key we read. Abort.
+                        self.tx_manager.finalize(&tx);
+                        return Err(VantaError::TransactionConflict {
+                            tx_id: tx_id.to_string(),
+                            reason: format!(
+                                "Read-set conflict: {}/{} was modified after snapshot",
+                                collection, doc_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         // Flush workspace entries to MVCCStore atomically.
-        // Group by database so we only open each engine once.
         for op in &tx.ops {
             match op {
                 TransactionOp::Insert { db, collection, document } => {
