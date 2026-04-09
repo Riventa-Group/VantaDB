@@ -4,6 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod auth;
 mod bench;
 mod cli;
+mod config;
 mod db;
 mod selfcheck;
 mod server;
@@ -70,19 +71,43 @@ struct Cli {
     /// Path to CA certificate PEM (for self-check TLS verification)
     #[arg(long)]
     tls_ca: Option<String>,
+
+    /// Path to configuration file (default: auto-search)
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Dump effective configuration and exit
+    #[arg(long = "dump-config")]
+    dump_config: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
 
+    // Load configuration
+    let mut cfg = config::Config::load(cli.config.as_deref());
+
+    // CLI flags override config values
+    if cli.port != 5432 {
+        cfg.server.port = cli.port;
+    }
+    if cli.no_tls {
+        cfg.server.tls = false;
+    }
+
+    if cli.dump_config {
+        print!("{}", cfg.dump());
+        return;
+    }
+
     if cli.self_check {
-        run_self_check(cli.user, cli.password, cli.port, cli.tls_cert, cli.tls_key, cli.tls_ca);
+        run_self_check(cli.user, cli.password, cfg.server.port, cli.tls_cert, cli.tls_key, cli.tls_ca);
     } else if cli.benchmark {
         run_benchmark();
+    } else if cli.serve {
+        run_server(&cfg);
     } else if cli.status {
         run_status();
-    } else if cli.serve {
-        run_server(cli.port, cli.no_tls);
     } else {
         run_login();
     }
@@ -181,7 +206,7 @@ fn run_status() {
     println!();
 }
 
-fn run_server(port: u16, no_tls: bool) {
+fn run_server(cfg: &config::Config) {
     Shell::print_banner();
 
     let (engine, auth, db_manager) = match Shell::init() {
@@ -197,7 +222,8 @@ fn run_server(port: u16, no_tls: bool) {
     };
 
     let data_dir = Shell::data_dir();
-    let use_tls = !no_tls;
+    let port = cfg.server.port;
+    let use_tls = cfg.server.tls;
 
     println!(
         "  {} Starting gRPC{} server on port {}...",
@@ -207,9 +233,10 @@ fn run_server(port: u16, no_tls: bool) {
     );
     println!();
 
+    let cfg = cfg.clone();
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async move {
-        if let Err(e) = server::start(auth, db_manager, port, &data_dir, engine, use_tls).await {
+        if let Err(e) = server::start(auth, db_manager, port, &data_dir, engine, use_tls, &cfg).await {
             eprintln!(
                 "  {} Server error: {}",
                 "✗".red().bold(),
