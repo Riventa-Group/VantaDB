@@ -90,8 +90,9 @@ impl AuditLogger {
     /// Query the audit log with optional filters.
     pub fn query(&self, filter: &AuditFilter) -> Vec<AuditEvent> {
         let limit = if filter.limit == 0 { 100 } else { filter.limit };
-        let keys = self.engine.list_keys(AUDIT_TABLE);
-        // Keys are sorted reverse-chronologically by construction
+        let mut keys = self.engine.list_keys(AUDIT_TABLE);
+        // Sort keys lexicographically — reverse-timestamp prefix ensures newest first
+        keys.sort();
         let mut results = Vec::new();
 
         for key in keys {

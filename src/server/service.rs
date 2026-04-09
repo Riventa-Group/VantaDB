@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -9,6 +10,7 @@ use super::auth_interceptor::{extract_auth, extract_auth_from_metadata, AuthCont
 use super::proto;
 use super::audit::AuditLogger;
 use super::lockout::LockoutTracker;
+use super::metrics::MetricsCollector;
 use super::rate_limit::{GlobalRateLimiter, RateLimiter};
 use super::session::JwtSessionManager;
 
@@ -20,6 +22,7 @@ pub struct VantaAuthServiceImpl {
     pub cert_manager: Arc<CertManager>,
     pub acl_manager: Arc<AclManager>,
     pub audit_logger: Arc<AuditLogger>,
+    pub metrics: Arc<MetricsCollector>,
     pub lockout_tracker: Arc<LockoutTracker>,
     pub global_auth_limiter: Arc<GlobalRateLimiter>,
     pub ip_auth_limiter: Arc<RateLimiter>,
@@ -31,6 +34,8 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::AuthRequest>,
     ) -> Result<Response<proto::AuthResponse>, Status> {
+        let _start = Instant::now();
+        self.metrics.inc("auth_attempts");
         // Rate limiting: global + per-IP
         if !self.global_auth_limiter.allow() {
             return Err(Status::resource_exhausted("Rate limit exceeded, try again later"));
@@ -89,6 +94,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
             }
             Ok(None) => {
                 self.lockout_tracker.record_failure(&username);
+                self.metrics.inc("auth_failures");
                 self.audit_logger.record(
                     &username, "", "authenticate",
                     None, None, "{}", false, Some("Invalid credentials"),
@@ -493,6 +499,54 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
 
         Ok(Response::new(proto::AuditLogResponse { entries }))
     }
+
+    // ---- Metrics & health ---------------------------------------
+
+    async fn get_metrics(
+        &self,
+        request: Request<proto::Empty>,
+    ) -> Result<Response<proto::MetricsResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let counters: Vec<proto::MetricEntry> = self.metrics.all_counters()
+            .into_iter()
+            .map(|(name, value)| proto::MetricEntry { name, value })
+            .collect();
+
+        let gauges: Vec<proto::MetricEntry> = self.metrics.all_gauges()
+            .into_iter()
+            .map(|(name, value)| proto::MetricEntry { name, value })
+            .collect();
+
+        let latencies: Vec<proto::LatencyEntry> = self.metrics.all_latencies()
+            .into_iter()
+            .map(|(op, p50, p95, p99)| proto::LatencyEntry {
+                operation: op,
+                p50_us: p50,
+                p95_us: p95,
+                p99_us: p99,
+            })
+            .collect();
+
+        Ok(Response::new(proto::MetricsResponse { counters, gauges, latencies }))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<proto::Empty>,
+    ) -> Result<Response<proto::HealthResponse>, Status> {
+        // No auth required — health checks must work from load balancers
+        Ok(Response::new(proto::HealthResponse {
+            status: "healthy".to_string(),
+            uptime_seconds: self.metrics.uptime_seconds(),
+            database_count: self.metrics.gauge("databases_count"),
+            active_transactions: self.metrics.gauge("active_transactions"),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }))
+    }
 }
 
 // ---- VantaDb Service -----------------------------------------
@@ -501,6 +555,7 @@ pub struct VantaDbServiceImpl {
     pub db_manager: Arc<DatabaseManager>,
     pub acl_manager: Arc<AclManager>,
     pub audit_logger: Arc<AuditLogger>,
+    pub metrics: Arc<MetricsCollector>,
 }
 
 /// Helper to convert VantaError to gRPC Status
