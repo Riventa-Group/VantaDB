@@ -3,6 +3,7 @@ pub mod auth_interceptor;
 pub mod lockout;
 pub mod metrics;
 pub mod rate_limit;
+pub mod scheduler;
 pub mod service;
 pub mod session;
 
@@ -19,6 +20,7 @@ use auth_interceptor::AuthInterceptor;
 use lockout::LockoutTracker;
 use metrics::MetricsCollector;
 use rate_limit::{GlobalRateLimiter, RateLimiter};
+use scheduler::BackgroundScheduler;
 use service::{VantaAuthServiceImpl, VantaDbServiceImpl};
 use session::JwtSessionManager;
 
@@ -76,6 +78,12 @@ pub async fn start(
     let interceptor = AuthInterceptor {
         jwt_manager: Arc::clone(&jwt_manager),
     };
+
+    // Start background scheduler for compaction, GC, and transaction reaping
+    let _scheduler = BackgroundScheduler::start(
+        Arc::clone(&db_manager),
+        Arc::clone(&metrics),
+    );
 
     let mut builder = Server::builder();
 

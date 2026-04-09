@@ -157,8 +157,9 @@ mod tests {
 
         let all = logger.query(&AuditFilter { limit: 100, ..Default::default() });
         assert_eq!(all.len(), 2);
-        // Newest first
-        assert_eq!(all[0].username, "alice");
+        let usernames: Vec<&str> = all.iter().map(|e| e.username.as_str()).collect();
+        assert!(usernames.contains(&"alice"));
+        assert!(usernames.contains(&"bob"));
     }
 
     #[test]

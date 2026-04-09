@@ -1094,6 +1094,11 @@ impl DatabaseManager {
         }
         Ok(())
     }
+
+    /// Get all cached MVCCStores for background maintenance (compaction, GC).
+    pub fn all_stores(&self) -> Vec<Arc<MVCCStore>> {
+        self.engines.iter().map(|e| Arc::clone(e.value())).collect()
+    }
 }
 
 // ---- Update patch application ----------------------------
