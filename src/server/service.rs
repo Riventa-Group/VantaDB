@@ -1165,6 +1165,43 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
 
         ok_status()
     }
+
+    async fn tx_find_by_id(
+        &self,
+        request: Request<proto::TxFindByIdRequest>,
+    ) -> Result<Response<proto::DocumentResponse>, Status> {
+        let ctx = extract_auth(&request)?;
+        let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
+
+        let mgr = Arc::clone(&self.db_manager);
+        let tx_id = req.tx_id;
+        let db = req.database;
+        let col = req.collection;
+        let id = req.id;
+
+        let result = tokio::task::spawn_blocking(move || mgr.tx_find_by_id(&tx_id, &db, &col, &id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
+
+        match result {
+            Some(doc) => {
+                let json = serde_json::to_string(&doc)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Ok(Response::new(proto::DocumentResponse {
+                    found: true,
+                    document_json: json,
+                    error: String::new(),
+                }))
+            }
+            None => Ok(Response::new(proto::DocumentResponse {
+                found: false,
+                document_json: String::new(),
+                error: String::new(),
+            })),
+        }
+    }
 }
 
 // ---- Helpers -------------------------------------------------

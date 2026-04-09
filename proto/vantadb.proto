@@ -75,6 +75,7 @@ service VantaDb {
   rpc TxInsert   (TxInsertRequest)  returns (StatusResponse);
   rpc TxUpdate   (TxUpdateRequest)  returns (StatusResponse);
   rpc TxDelete   (TxDeleteRequest)  returns (StatusResponse);
+  rpc TxFindById (TxFindByIdRequest) returns (DocumentResponse);
 }
 
 // ─── Common ──────────────────────────────────
@@ -414,6 +415,13 @@ message TxUpdateRequest {
 }
 
 message TxDeleteRequest {
+  string tx_id      = 1;
+  string database   = 2;
+  string collection = 3;
+  string id         = 4;
+}
+
+message TxFindByIdRequest {
   string tx_id      = 1;
   string database   = 2;
   string collection = 3;
