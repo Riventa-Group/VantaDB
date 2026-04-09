@@ -6,7 +6,7 @@ use std::io;
 use crate::auth::Role;
 use crate::bench;
 use crate::cli::Shell;
-use crate::db::{CollectionSchema, QueryOptions};
+use crate::db::{CollectionSchema, QueryOptions, VantaError};
 
 pub fn handle_command(shell: &mut Shell, input: &str) -> io::Result<bool> {
     let parts: Vec<&str> = input.split_whitespace().collect();
@@ -52,6 +52,21 @@ pub fn handle_command(shell: &mut Shell, input: &str) -> io::Result<bool> {
     }
 
     Ok(false)
+}
+
+/// Display a VantaError to the user with appropriate coloring.
+fn print_error(e: &VantaError) {
+    match e {
+        VantaError::NotFound { .. } | VantaError::AlreadyExists { .. } => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().yellow());
+        }
+        VantaError::ValidationFailed { .. } => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().yellow());
+        }
+        _ => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().red());
+        }
+    }
 }
 
 fn cmd_help(_shell: &Shell) {
@@ -263,7 +278,7 @@ fn cmd_show(shell: &Shell, parts: &[&str]) {
                 None => return,
             };
             match shell.db_manager.list_collections(&db) {
-                Ok(Ok(cols)) => {
+                Ok(cols) => {
                     if cols.is_empty() {
                         println!(
                             "  {} No collections in '{}'",
@@ -287,8 +302,7 @@ fn cmd_show(shell: &Shell, parts: &[&str]) {
                         );
                     }
                 }
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.red()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "indexes" => {
@@ -305,7 +319,7 @@ fn cmd_show(shell: &Shell, parts: &[&str]) {
                 None => return,
             };
             match shell.db_manager.list_indexes(&db, parts[2]) {
-                Ok(Ok(indexes)) => {
+                Ok(indexes) => {
                     if indexes.is_empty() {
                         println!(
                             "  {} No indexes on '{}'",
@@ -339,8 +353,7 @@ fn cmd_show(shell: &Shell, parts: &[&str]) {
                         );
                     }
                 }
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.red()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         _ => {
@@ -375,13 +388,12 @@ fn cmd_create(shell: &Shell, parts: &[&str]) {
                 return;
             }
             match shell.db_manager.create_database(parts[2]) {
-                Ok(Ok(())) => println!(
+                Ok(()) => println!(
                     "  {} Database '{}' created",
                     "✓".green().bold(),
                     parts[2].bold().truecolor(120, 200, 120)
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "collection" | "col" => {
@@ -394,14 +406,13 @@ fn cmd_create(shell: &Shell, parts: &[&str]) {
                 None => return,
             };
             match shell.db_manager.create_collection(&db, parts[2]) {
-                Ok(Ok(())) => println!(
+                Ok(()) => println!(
                     "  {} Collection '{}' created in '{}'",
                     "✓".green().bold(),
                     parts[2].bold().cyan(),
                     db
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "index" | "idx" => {
@@ -423,7 +434,7 @@ fn cmd_create(shell: &Shell, parts: &[&str]) {
             };
             let unique = parts.len() > 4 && parts[4] == "unique";
             match shell.db_manager.create_index(&db, parts[2], parts[3], unique) {
-                Ok(Ok(())) => {
+                Ok(()) => {
                     let unique_msg = if unique { " (unique)" } else { "" };
                     println!(
                         "  {} Index on '{}'{} created in '{}'",
@@ -433,8 +444,7 @@ fn cmd_create(shell: &Shell, parts: &[&str]) {
                         parts[2]
                     );
                 }
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         _ => {
@@ -466,7 +476,7 @@ fn cmd_drop(shell: &mut Shell, parts: &[&str]) {
                 return;
             }
             match shell.db_manager.drop_database(parts[2]) {
-                Ok(Ok(())) => {
+                Ok(()) => {
                     if shell.current_db.as_deref() == Some(parts[2]) {
                         shell.current_db = None;
                     }
@@ -476,8 +486,7 @@ fn cmd_drop(shell: &mut Shell, parts: &[&str]) {
                         parts[2].bold()
                     );
                 }
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "collection" | "col" => {
@@ -490,14 +499,13 @@ fn cmd_drop(shell: &mut Shell, parts: &[&str]) {
                 None => return,
             };
             match shell.db_manager.drop_collection(&db, parts[2]) {
-                Ok(Ok(())) => println!(
+                Ok(()) => println!(
                     "  {} Collection '{}' dropped from '{}'",
                     "✓".green().bold(),
                     parts[2].bold(),
                     db
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "index" | "idx" => {
@@ -518,14 +526,13 @@ fn cmd_drop(shell: &mut Shell, parts: &[&str]) {
                 None => return,
             };
             match shell.db_manager.drop_index(&db, parts[2], parts[3]) {
-                Ok(Ok(())) => println!(
+                Ok(()) => println!(
                     "  {} Index on '{}' dropped from '{}'",
                     "✓".green().bold(),
                     parts[3].bold(),
                     parts[2]
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         _ => {
@@ -579,17 +586,16 @@ fn cmd_insert(shell: &Shell, parts: &[&str]) {
     }
 
     match shell.db_manager.insert(&db, collection, doc) {
-        Ok(Ok(id)) => println!(
+        Ok(id) => println!(
             "  {} Inserted with _id: {}",
             "✓".green().bold(),
             id.truecolor(180, 180, 255)
         ),
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Err(e) => print_error(&e),
     }
 }
 
-// ─── Update command ──────────────────────────
+// ---- Update command ------------------------------------------
 
 fn cmd_update(shell: &Shell, parts: &[&str]) {
     if parts.len() < 4 {
@@ -650,13 +656,12 @@ fn cmd_update(shell: &Shell, parts: &[&str]) {
                     .db_manager
                     .update_where(&db, collection, &filter, &patch)
                 {
-                    Ok(Ok(count)) => println!(
+                    Ok(count) => println!(
                         "  {} {} document(s) updated",
                         "✓".green().bold(),
                         count.to_string().bold()
                     ),
-                    Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                    Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                    Err(e) => print_error(&e),
                 }
             }
             _ => {
@@ -686,19 +691,18 @@ fn cmd_update(shell: &Shell, parts: &[&str]) {
     };
 
     match shell.db_manager.update_by_id(&db, collection, id, patch) {
-        Ok(Ok(true)) => println!("  {} Document updated", "✓".green().bold()),
-        Ok(Ok(false)) => {
+        Ok(true) => println!("  {} Document updated", "✓".green().bold()),
+        Ok(false) => {
             println!(
                 "  {} Document not found",
                 "ℹ".truecolor(120, 80, 255)
             )
         }
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Err(e) => print_error(&e),
     }
 }
 
-// ─── Rich query command ──────────────────────
+// ---- Rich query command --------------------------------------
 
 fn cmd_query(shell: &Shell, parts: &[&str]) {
     let (opts, parts) = extract_query_options(parts);
@@ -732,13 +736,12 @@ fn cmd_query(shell: &Shell, parts: &[&str]) {
     };
 
     match shell.db_manager.query(&db, collection, &filter, &opts) {
-        Ok(Ok((docs, total))) => print_documents_paged(&docs, total, &opts),
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Ok((docs, total)) => print_documents_paged(&docs, total, &opts),
+        Err(e) => print_error(&e),
     }
 }
 
-// ─── Aggregation command ─────────────────────
+// ---- Aggregation command -------------------------------------
 
 fn cmd_aggregate(shell: &Shell, parts: &[&str]) {
     if parts.len() < 3 {
@@ -775,7 +778,7 @@ fn cmd_aggregate(shell: &Shell, parts: &[&str]) {
     };
 
     match shell.db_manager.aggregate(&db, collection, &pipeline) {
-        Ok(Ok(results)) => {
+        Ok(results) => {
             if results.is_empty() {
                 println!(
                     "  {} No results",
@@ -804,12 +807,11 @@ fn cmd_aggregate(shell: &Shell, parts: &[&str]) {
                 );
             }
         }
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Err(e) => print_error(&e),
     }
 }
 
-// ─── Schema command ──────────────────────────
+// ---- Schema command ------------------------------------------
 
 fn cmd_schema(shell: &Shell, parts: &[&str]) {
     if parts.len() < 3 {
@@ -863,19 +865,18 @@ fn cmd_schema(shell: &Shell, parts: &[&str]) {
                 }
             };
             match shell.db_manager.set_schema(&db, collection, &schema) {
-                Ok(Ok(())) => println!(
+                Ok(()) => println!(
                     "  {} Schema set on '{}'",
                     "✓".green().bold(),
                     collection.bold().cyan()
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "get" => {
             let collection = parts[2];
             match shell.db_manager.get_schema(&db, collection) {
-                Ok(Ok(Some(schema))) => {
+                Ok(Some(schema)) => {
                     let json = serde_json::to_string_pretty(&schema.to_json()).unwrap_or_default();
                     println!();
                     for line in json.lines() {
@@ -883,13 +884,12 @@ fn cmd_schema(shell: &Shell, parts: &[&str]) {
                     }
                     println!();
                 }
-                Ok(Ok(None)) => println!(
+                Ok(None) => println!(
                     "  {} No schema on '{}'",
                     "ℹ".truecolor(120, 80, 255),
                     collection
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         "drop" => {
@@ -899,13 +899,12 @@ fn cmd_schema(shell: &Shell, parts: &[&str]) {
             }
             let collection = parts[2];
             match shell.db_manager.drop_schema(&db, collection) {
-                Ok(Ok(())) => println!(
+                Ok(()) => println!(
                     "  {} Schema removed from '{}'",
                     "✓".green().bold(),
                     collection.bold()
                 ),
-                Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+                Err(e) => print_error(&e),
             }
         }
         _ => {
@@ -918,7 +917,7 @@ fn cmd_schema(shell: &Shell, parts: &[&str]) {
     }
 }
 
-// ─── Transaction commands ────────────────────
+// ---- Transaction commands ------------------------------------
 
 fn cmd_begin_tx(shell: &mut Shell) {
     if shell.current_tx.is_some() {
@@ -955,12 +954,11 @@ fn cmd_commit_tx(shell: &mut Shell) {
     }
 
     match shell.db_manager.commit_transaction(&tx_id) {
-        Ok(Ok(())) => {
+        Ok(()) => {
             println!("  {} Transaction committed", "✓".green().bold());
             shell.current_tx = None;
         }
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Err(e) => print_error(&e),
     }
 }
 
@@ -981,7 +979,7 @@ fn cmd_rollback_tx(shell: &mut Shell) {
             println!("  {} Transaction rolled back", "✓".green().bold());
             shell.current_tx = None;
         }
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.yellow()),
+        Err(e) => print_error(&e),
     }
 }
 
@@ -1039,7 +1037,7 @@ fn cmd_tx_op(shell: &Shell, parts: &[&str]) {
             };
             match shell.db_manager.tx_insert(&tx_id, db, collection, doc) {
                 Ok(()) => println!("  {} Insert queued", "✓".green().bold()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.yellow()),
+                Err(e) => print_error(&e),
             }
         }
         "update" => {
@@ -1067,7 +1065,7 @@ fn cmd_tx_op(shell: &Shell, parts: &[&str]) {
             };
             match shell.db_manager.tx_update(&tx_id, db, collection, id, patch) {
                 Ok(()) => println!("  {} Update queued", "✓".green().bold()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.yellow()),
+                Err(e) => print_error(&e),
             }
         }
         "delete" => {
@@ -1083,7 +1081,7 @@ fn cmd_tx_op(shell: &Shell, parts: &[&str]) {
             let id = parts[3].to_string();
             match shell.db_manager.tx_delete(&tx_id, db, collection, id) {
                 Ok(()) => println!("  {} Delete queued", "✓".green().bold()),
-                Err(e) => println!("  {} {}", "✗".red().bold(), e.yellow()),
+                Err(e) => print_error(&e),
             }
         }
         _ => {
@@ -1096,7 +1094,7 @@ fn cmd_tx_op(shell: &Shell, parts: &[&str]) {
     }
 }
 
-// ─── Find command (existing + pagination) ────
+// ---- Find command (existing + pagination) --------------------
 
 fn extract_query_options<'a>(parts: &[&'a str]) -> (QueryOptions, Vec<&'a str>) {
     let mut opts = QueryOptions::default();
@@ -1176,9 +1174,8 @@ fn cmd_find(shell: &Shell, parts: &[&str]) {
             .db_manager
             .find_where_query(&db, collection, field, &value, &opts)
         {
-            Ok(Ok((docs, total))) => print_documents_paged(&docs, total, &opts),
-            Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-            Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+            Ok((docs, total)) => print_documents_paged(&docs, total, &opts),
+            Err(e) => print_error(&e),
         }
         return;
     }
@@ -1186,22 +1183,20 @@ fn cmd_find(shell: &Shell, parts: &[&str]) {
     // find <col> <id>
     if parts.len() == 3 && !has_opts {
         match shell.db_manager.find_by_id(&db, collection, parts[2]) {
-            Ok(Ok(Some(doc))) => print_documents(&[doc]),
-            Ok(Ok(None)) => println!(
+            Ok(Some(doc)) => print_documents(&[doc]),
+            Ok(None) => println!(
                 "  {} Document not found",
                 "ℹ".truecolor(120, 80, 255)
             ),
-            Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-            Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+            Err(e) => print_error(&e),
         }
         return;
     }
 
     // find <col>
     match shell.db_manager.find_all_query(&db, collection, &opts) {
-        Ok(Ok((docs, total))) => print_documents_paged(&docs, total, &opts),
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Ok((docs, total)) => print_documents_paged(&docs, total, &opts),
+        Err(e) => print_error(&e),
     }
 }
 
@@ -1290,13 +1285,12 @@ fn cmd_delete(shell: &Shell, parts: &[&str]) {
     };
 
     match shell.db_manager.delete_by_id(&db, parts[1], parts[2]) {
-        Ok(Ok(true)) => println!("  {} Document deleted", "✓".green().bold()),
-        Ok(Ok(false)) => println!(
+        Ok(true) => println!("  {} Document deleted", "✓".green().bold()),
+        Ok(false) => println!(
             "  {} Document not found",
             "ℹ".truecolor(120, 80, 255)
         ),
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Err(e) => print_error(&e),
     }
 }
 
@@ -1316,14 +1310,13 @@ fn cmd_count(shell: &Shell, parts: &[&str]) {
     };
 
     match shell.db_manager.count(&db, parts[1]) {
-        Ok(Ok(n)) => println!(
+        Ok(n) => println!(
             "  {} {} document(s) in '{}'",
             "▸".truecolor(120, 80, 255),
             n.to_string().bold(),
             parts[1]
         ),
-        Ok(Err(e)) => println!("  {} {}", "✗".red().bold(), e.yellow()),
-        Err(e) => println!("  {} {}", "✗".red().bold(), e.to_string().red()),
+        Err(e) => print_error(&e),
     }
 }
 
@@ -1506,7 +1499,7 @@ fn cmd_status(shell: &Shell) {
     println!(
         "  {} {}",
         "Version:".dimmed(),
-        "0.1.0".truecolor(120, 200, 120)
+        env!("CARGO_PKG_VERSION").truecolor(120, 200, 120)
     );
     println!(
         "  {} {}",
@@ -1544,7 +1537,7 @@ fn cmd_status(shell: &Shell) {
     println!();
 }
 
-// ─── Helpers ─────────────────────────────────
+// ---- Helpers -------------------------------------------------
 
 fn require_db(shell: &Shell) -> Option<String> {
     match &shell.current_db {

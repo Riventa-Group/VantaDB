@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use super::error::VantaError;
+
 /// A single operation within a transaction.
 #[derive(Debug, Clone)]
 pub enum TransactionOp {
@@ -59,26 +61,35 @@ impl TransactionManager {
         id
     }
 
-    pub fn add_op(&self, tx_id: &str, op: TransactionOp) -> Result<(), String> {
+    pub fn add_op(&self, tx_id: &str, op: TransactionOp) -> Result<(), VantaError> {
         self.active
             .lock()
             .get_mut(tx_id)
             .map(|tx| tx.ops.push(op))
-            .ok_or_else(|| format!("Transaction '{}' not found", tx_id))
+            .ok_or_else(|| VantaError::NotFound {
+                entity: "Transaction",
+                name: tx_id.to_string(),
+            })
     }
 
-    pub fn take(&self, tx_id: &str) -> Result<Transaction, String> {
+    pub fn take(&self, tx_id: &str) -> Result<Transaction, VantaError> {
         self.active
             .lock()
             .remove(tx_id)
-            .ok_or_else(|| format!("Transaction '{}' not found", tx_id))
+            .ok_or_else(|| VantaError::NotFound {
+                entity: "Transaction",
+                name: tx_id.to_string(),
+            })
     }
 
-    pub fn rollback(&self, tx_id: &str) -> Result<(), String> {
+    pub fn rollback(&self, tx_id: &str) -> Result<(), VantaError> {
         self.active
             .lock()
             .remove(tx_id)
             .map(|_| ())
-            .ok_or_else(|| format!("Transaction '{}' not found", tx_id))
+            .ok_or_else(|| VantaError::NotFound {
+                entity: "Transaction",
+                name: tx_id.to_string(),
+            })
     }
 }

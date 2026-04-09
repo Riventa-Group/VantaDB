@@ -3,7 +3,6 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -11,6 +10,7 @@ use uuid::Uuid;
 use crate::storage::StorageEngine;
 
 use super::aggregation;
+use super::error::VantaError;
 use super::filter::matches_filter;
 use super::index::{IndexDef, IndexManager};
 use super::schema::CollectionSchema;
@@ -18,7 +18,7 @@ use super::transaction::{TransactionManager, TransactionOp};
 
 const META_TABLE: &str = "_vanta_meta";
 
-// ─── Query options ──────────────────────────────────────
+// ---- Query options ----------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
@@ -86,7 +86,7 @@ fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Orderi
     }
 }
 
-// ─── Database metadata ──────────────────────────────────
+// ---- Database metadata ------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DbMeta {
@@ -94,7 +94,7 @@ struct DbMeta {
     collections: Vec<String>,
 }
 
-// ─── Database Manager ───────────────────────────────────
+// ---- Database Manager -------------------------------------
 
 pub struct DatabaseManager {
     base_path: PathBuf,
@@ -107,7 +107,7 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
-    pub fn new(base_path: &Path) -> io::Result<Self> {
+    pub fn new(base_path: &Path) -> Result<Self, VantaError> {
         let meta_engine = StorageEngine::open(&base_path.join("_meta"))?;
         if !meta_engine.table_exists(META_TABLE) {
             meta_engine.create_table(META_TABLE)?;
@@ -126,7 +126,7 @@ impl DatabaseManager {
     /// Get or open a cached StorageEngine for a database (#8).
     /// Engines are cached for the lifetime of the DatabaseManager and only
     /// evicted on drop_database.
-    fn db_engine(&self, db_name: &str) -> io::Result<Arc<StorageEngine>> {
+    fn db_engine(&self, db_name: &str) -> Result<Arc<StorageEngine>, VantaError> {
         if let Some(engine) = self.engines.get(db_name) {
             return Ok(Arc::clone(engine.value()));
         }
@@ -156,31 +156,42 @@ impl DatabaseManager {
         format!("_idx:{}:{}:{}", db, collection, field)
     }
 
-    // ─── Database ops ────────────────────────────────
+    fn require_db(&self, db: &str) -> Result<(), VantaError> {
+        if self.meta_engine.get(META_TABLE, db).is_some() {
+            Ok(())
+        } else {
+            Err(VantaError::NotFound {
+                entity: "Database",
+                name: db.to_string(),
+            })
+        }
+    }
 
-    pub fn create_database(&self, name: &str) -> io::Result<Result<(), String>> {
+    // ---- Database ops ----------------------------------------
+
+    pub fn create_database(&self, name: &str) -> Result<(), VantaError> {
         let _guard = self.global_ddl_lock.write();
         if self.meta_engine.get(META_TABLE, name).is_some() {
-            return Ok(Err(format!("Database '{}' already exists", name)));
+            return Err(VantaError::AlreadyExists {
+                entity: "Database",
+                name: name.to_string(),
+            });
         }
         let meta = DbMeta {
             name: name.to_string(),
             collections: vec![],
         };
-        let data =
-            bincode::serialize(&meta).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = bincode::serialize(&meta)?;
         self.meta_engine.put(META_TABLE, name, &data)?;
         std::fs::create_dir_all(self.base_path.join(name))?;
-        Ok(Ok(()))
+        Ok(())
     }
 
-    pub fn drop_database(&self, name: &str) -> io::Result<Result<(), String>> {
+    pub fn drop_database(&self, name: &str) -> Result<(), VantaError> {
         let _guard = self.global_ddl_lock.write();
-        if self.meta_engine.get(META_TABLE, name).is_none() {
-            return Ok(Err(format!("Database '{}' not found", name)));
-        }
+        self.require_db(name)?;
         // Clean up indexes and schemas for all collections
-        if let Ok(Ok(cols)) = self.list_collections(name) {
+        if let Ok(cols) = self.list_collections(name) {
             for col in &cols {
                 let key = Self::idx_key(name, col);
                 self.index_manager.drop_collection_indexes(&key);
@@ -196,7 +207,7 @@ impl DatabaseManager {
         if db_path.exists() {
             std::fs::remove_dir_all(db_path)?;
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
     pub fn list_databases(&self) -> Vec<String> {
@@ -211,38 +222,34 @@ impl DatabaseManager {
         self.meta_engine.get(META_TABLE, name).is_some()
     }
 
-    // ─── Collection ops ──────────────────────────────
+    // ---- Collection ops --------------------------------------
 
-    pub fn create_collection(&self, db: &str, collection: &str) -> io::Result<Result<(), String>> {
+    pub fn create_collection(&self, db: &str, collection: &str) -> Result<(), VantaError> {
         let lock = self.db_read_lock(db);
         let _guard = lock.write(); // exclusive DDL lock on this database (#10)
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
         if engine.table_exists(collection) {
-            return Ok(Err(format!(
-                "Collection '{}' already exists in '{}'",
-                collection, db
-            )));
+            return Err(VantaError::AlreadyExists {
+                entity: "Collection",
+                name: format!("{}/{}", db, collection),
+            });
         }
         engine.create_table(collection)?;
         self.update_meta_collections(db, |cols| cols.push(collection.to_string()))?;
-        Ok(Ok(()))
+        Ok(())
     }
 
-    pub fn drop_collection(&self, db: &str, collection: &str) -> io::Result<Result<(), String>> {
+    pub fn drop_collection(&self, db: &str, collection: &str) -> Result<(), VantaError> {
         let lock = self.db_read_lock(db);
         let _guard = lock.write(); // exclusive DDL lock on this database (#10)
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
         if !engine.table_exists(collection) {
-            return Ok(Err(format!(
-                "Collection '{}' not found in '{}'",
-                collection, db
-            )));
+            return Err(VantaError::NotFound {
+                entity: "Collection",
+                name: format!("{}/{}", db, collection),
+            });
         }
         engine.drop_table(collection)?;
         self.update_meta_collections(db, |cols| cols.retain(|c| c != collection))?;
@@ -253,46 +260,42 @@ impl DatabaseManager {
         let schema_key = Self::schema_meta_key(db, collection);
         let _ = self.meta_engine.delete(META_TABLE, &schema_key);
 
-        Ok(Ok(()))
+        Ok(())
     }
 
-    pub fn list_collections(&self, db: &str) -> io::Result<Result<Vec<String>, String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    pub fn list_collections(&self, db: &str) -> Result<Vec<String>, VantaError> {
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
-        Ok(Ok(engine
+        Ok(engine
             .list_tables()
             .into_iter()
             .filter(|t| !t.starts_with('_'))
-            .collect()))
+            .collect())
     }
 
-    // ─── Document CRUD ───────────────────────────────
+    // ---- Document CRUD ---------------------------------------
 
     pub fn insert(
         &self,
         db: &str,
         collection: &str,
         document: Value,
-    ) -> io::Result<Result<String, String>> {
+    ) -> Result<String, VantaError> {
         let lock = self.db_read_lock(db);
         let _guard = lock.read(); // shared DML lock — DDL blocked while active (#10)
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
         if !engine.table_exists(collection) {
-            return Ok(Err(format!("Collection '{}' not found", collection)));
+            return Err(VantaError::NotFound {
+                entity: "Collection",
+                name: collection.to_string(),
+            });
         }
 
         // Schema validation
         if let Some(schema) = self.get_schema_internal(db, collection) {
             if let Err(errors) = schema.validate(&document) {
-                return Ok(Err(format!(
-                    "Schema validation failed: {}",
-                    errors.join("; ")
-                )));
+                return Err(VantaError::ValidationFailed { errors });
             }
         }
 
@@ -310,15 +313,14 @@ impl DatabaseManager {
             o.insert("_id".to_string(), Value::String(id.clone()));
         }
 
-        let data =
-            serde_json::to_vec(&doc).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec(&doc)?;
         engine.put(collection, &id, &data)?;
 
         // Update indexes
         let idx_key = Self::idx_key(db, collection);
         self.index_manager.on_insert(&idx_key, &id, &doc);
 
-        Ok(Ok(id))
+        Ok(id)
     }
 
     pub fn find_by_id(
@@ -326,29 +328,20 @@ impl DatabaseManager {
         db: &str,
         collection: &str,
         id: &str,
-    ) -> io::Result<Result<Option<Value>, String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    ) -> Result<Option<Value>, VantaError> {
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
         match engine.get(collection, id) {
             Some(data) => {
-                let doc: Value = serde_json::from_slice(&data)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                Ok(Ok(Some(doc)))
+                let doc: Value = serde_json::from_slice(&data)?;
+                Ok(Some(doc))
             }
-            None => Ok(Ok(None)),
+            None => Ok(None),
         }
     }
 
-    pub fn find_all(
-        &self,
-        db: &str,
-        collection: &str,
-    ) -> io::Result<Result<Vec<Value>, String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    pub fn find_all(&self, db: &str, collection: &str) -> Result<Vec<Value>, VantaError> {
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
         let keys = engine.list_keys(collection);
         let mut docs = Vec::with_capacity(keys.len());
@@ -359,7 +352,7 @@ impl DatabaseManager {
                 }
             }
         }
-        Ok(Ok(docs))
+        Ok(docs)
     }
 
     pub fn find_where(
@@ -368,18 +361,13 @@ impl DatabaseManager {
         collection: &str,
         field: &str,
         value: &Value,
-    ) -> io::Result<Result<Vec<Value>, String>> {
-        let all = self.find_all(db, collection)?;
-        match all {
-            Ok(docs) => {
-                let filtered: Vec<Value> = docs
-                    .into_iter()
-                    .filter(|doc| doc.get(field) == Some(value))
-                    .collect();
-                Ok(Ok(filtered))
-            }
-            Err(e) => Ok(Err(e)),
-        }
+    ) -> Result<Vec<Value>, VantaError> {
+        let docs = self.find_all(db, collection)?;
+        let filtered: Vec<Value> = docs
+            .into_iter()
+            .filter(|doc| doc.get(field) == Some(value))
+            .collect();
+        Ok(filtered)
     }
 
     pub fn find_all_query(
@@ -387,11 +375,9 @@ impl DatabaseManager {
         db: &str,
         collection: &str,
         opts: &QueryOptions,
-    ) -> io::Result<Result<(Vec<Value>, usize), String>> {
-        match self.find_all(db, collection)? {
-            Ok(docs) => Ok(Ok(opts.apply(docs))),
-            Err(e) => Ok(Err(e)),
-        }
+    ) -> Result<(Vec<Value>, usize), VantaError> {
+        let docs = self.find_all(db, collection)?;
+        Ok(opts.apply(docs))
     }
 
     pub fn find_where_query(
@@ -401,11 +387,9 @@ impl DatabaseManager {
         field: &str,
         value: &Value,
         opts: &QueryOptions,
-    ) -> io::Result<Result<(Vec<Value>, usize), String>> {
-        match self.find_where(db, collection, field, value)? {
-            Ok(docs) => Ok(Ok(opts.apply(docs))),
-            Err(e) => Ok(Err(e)),
-        }
+    ) -> Result<(Vec<Value>, usize), VantaError> {
+        let docs = self.find_where(db, collection, field, value)?;
+        Ok(opts.apply(docs))
     }
 
     pub fn delete_by_id(
@@ -413,12 +397,10 @@ impl DatabaseManager {
         db: &str,
         collection: &str,
         id: &str,
-    ) -> io::Result<Result<bool, String>> {
+    ) -> Result<bool, VantaError> {
         let lock = self.db_read_lock(db);
         let _guard = lock.read();
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
 
         // Get old doc for index update
@@ -435,18 +417,16 @@ impl DatabaseManager {
             }
         }
 
-        Ok(Ok(deleted))
+        Ok(deleted)
     }
 
-    pub fn count(&self, db: &str, collection: &str) -> io::Result<Result<usize, String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    pub fn count(&self, db: &str, collection: &str) -> Result<usize, VantaError> {
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
-        Ok(Ok(engine.count(collection)))
+        Ok(engine.count(collection))
     }
 
-    // ─── Update operations ───────────────────────────
+    // ---- Update operations -----------------------------------
 
     pub fn update_by_id(
         &self,
@@ -454,38 +434,29 @@ impl DatabaseManager {
         collection: &str,
         id: &str,
         patch: Value,
-    ) -> io::Result<Result<bool, String>> {
+    ) -> Result<bool, VantaError> {
         let lock = self.db_read_lock(db);
         let _guard = lock.read();
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+        self.require_db(db)?;
         let engine = self.db_engine(db)?;
 
         let old_data = match engine.get(collection, id) {
             Some(d) => d,
-            None => return Ok(Ok(false)),
+            None => return Ok(false),
         };
-        let old_doc: Value = serde_json::from_slice(&old_data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let old_doc: Value = serde_json::from_slice(&old_data)?;
 
         let mut new_doc = old_doc.clone();
-        if let Err(e) = apply_update(&mut new_doc, &patch) {
-            return Ok(Err(e));
-        }
+        apply_update(&mut new_doc, &patch)?;
 
         // Schema validation on the updated document
         if let Some(schema) = self.get_schema_internal(db, collection) {
             if let Err(errors) = schema.validate(&new_doc) {
-                return Ok(Err(format!(
-                    "Schema validation failed: {}",
-                    errors.join("; ")
-                )));
+                return Err(VantaError::ValidationFailed { errors });
             }
         }
 
-        let data =
-            serde_json::to_vec(&new_doc).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec(&new_doc)?;
         engine.put(collection, id, &data)?;
 
         // Update indexes
@@ -493,7 +464,7 @@ impl DatabaseManager {
         self.index_manager
             .on_update(&idx_key, id, &old_doc, &new_doc);
 
-        Ok(Ok(true))
+        Ok(true)
     }
 
     pub fn update_where(
@@ -502,12 +473,8 @@ impl DatabaseManager {
         collection: &str,
         filter: &Value,
         patch: &Value,
-    ) -> io::Result<Result<u64, String>> {
-        let docs = match self.find_all(db, collection)? {
-            Ok(d) => d,
-            Err(e) => return Ok(Err(e)),
-        };
-
+    ) -> Result<u64, VantaError> {
+        let docs = self.find_all(db, collection)?;
         let engine = self.db_engine(db)?;
         let schema = self.get_schema_internal(db, collection);
         let idx_key = Self::idx_key(db, collection);
@@ -533,17 +500,16 @@ impl DatabaseManager {
                 }
             }
 
-            let data = serde_json::to_vec(&new_doc)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let data = serde_json::to_vec(&new_doc)?;
             engine.put(collection, &id, &data)?;
             self.index_manager.on_update(&idx_key, &id, doc, &new_doc);
             modified += 1;
         }
 
-        Ok(Ok(modified))
+        Ok(modified)
     }
 
-    // ─── Rich query (filter) ─────────────────────────
+    // ---- Rich query (filter) ---------------------------------
 
     pub fn query(
         &self,
@@ -551,50 +517,40 @@ impl DatabaseManager {
         collection: &str,
         filter: &Value,
         opts: &QueryOptions,
-    ) -> io::Result<Result<(Vec<Value>, usize), String>> {
-        let all = match self.find_all(db, collection)? {
-            Ok(d) => d,
-            Err(e) => return Ok(Err(e)),
-        };
+    ) -> Result<(Vec<Value>, usize), VantaError> {
+        let all = self.find_all(db, collection)?;
 
         let filtered: Vec<Value> = all
             .into_iter()
             .filter(|doc| matches_filter(doc, filter))
             .collect();
 
-        Ok(Ok(opts.apply(filtered)))
+        Ok(opts.apply(filtered))
     }
 
-    // ─── Aggregation ─────────────────────────────────
+    // ---- Aggregation -----------------------------------------
 
     pub fn aggregate(
         &self,
         db: &str,
         collection: &str,
         pipeline: &[Value],
-    ) -> io::Result<Result<Vec<Value>, String>> {
-        let docs = match self.find_all(db, collection)? {
-            Ok(d) => d,
-            Err(e) => return Ok(Err(e)),
-        };
+    ) -> Result<Vec<Value>, VantaError> {
+        let docs = self.find_all(db, collection)?;
 
         let db_owned = db.to_string();
         let self_ref = &self;
         let resolver = move |foreign_col: &str| -> Vec<Value> {
             self_ref
                 .find_all(&db_owned, foreign_col)
-                .ok()
-                .and_then(|r| r.ok())
                 .unwrap_or_default()
         };
 
-        match aggregation::execute_pipeline(docs, pipeline, &resolver) {
-            Ok(results) => Ok(Ok(results)),
-            Err(e) => Ok(Err(e)),
-        }
+        aggregation::execute_pipeline(docs, pipeline, &resolver)
+            .map_err(|e| VantaError::Internal(e))
     }
 
-    // ─── Index operations ────────────────────────────
+    // ---- Index operations ------------------------------------
 
     pub fn create_index(
         &self,
@@ -602,23 +558,21 @@ impl DatabaseManager {
         collection: &str,
         field: &str,
         unique: bool,
-    ) -> io::Result<Result<(), String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    ) -> Result<(), VantaError> {
+        self.require_db(db)?;
 
         let key = Self::idx_key(db, collection);
 
         // Check if index already exists
         if self.index_manager.get_index(&key, field).is_some() {
-            return Ok(Err(format!("Index on '{}' already exists", field)));
+            return Err(VantaError::AlreadyExists {
+                entity: "Index",
+                name: field.to_string(),
+            });
         }
 
         // Load all docs to build the index
-        let docs = match self.find_all(db, collection)? {
-            Ok(d) => d,
-            Err(e) => return Ok(Err(e)),
-        };
+        let docs = self.find_all(db, collection)?;
 
         let doc_pairs: Vec<(String, Value)> = docs
             .into_iter()
@@ -638,11 +592,10 @@ impl DatabaseManager {
 
         // Persist index definition
         let meta_key = Self::index_meta_key(db, collection, field);
-        let data =
-            serde_json::to_vec(&def).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec(&def)?;
         self.meta_engine.put(META_TABLE, &meta_key, &data)?;
 
-        Ok(Ok(()))
+        Ok(())
     }
 
     pub fn drop_index(
@@ -650,68 +603,58 @@ impl DatabaseManager {
         db: &str,
         collection: &str,
         field: &str,
-    ) -> io::Result<Result<(), String>> {
+    ) -> Result<(), VantaError> {
         let key = Self::idx_key(db, collection);
         if !self.index_manager.remove_index(&key, field) {
-            return Ok(Err(format!("Index on '{}' not found", field)));
+            return Err(VantaError::NotFound {
+                entity: "Index",
+                name: field.to_string(),
+            });
         }
         let meta_key = Self::index_meta_key(db, collection, field);
         let _ = self.meta_engine.delete(META_TABLE, &meta_key);
-        Ok(Ok(()))
+        Ok(())
     }
 
     pub fn list_indexes(
         &self,
         db: &str,
         collection: &str,
-    ) -> io::Result<Result<Vec<IndexDef>, String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    ) -> Result<Vec<IndexDef>, VantaError> {
+        self.require_db(db)?;
         let key = Self::idx_key(db, collection);
-        Ok(Ok(self.index_manager.list_indexes(&key)))
+        Ok(self.index_manager.list_indexes(&key))
     }
 
-    // ─── Schema operations ───────────────────────────
+    // ---- Schema operations -----------------------------------
 
     pub fn set_schema(
         &self,
         db: &str,
         collection: &str,
         schema: &CollectionSchema,
-    ) -> io::Result<Result<(), String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    ) -> Result<(), VantaError> {
+        self.require_db(db)?;
         let key = Self::schema_meta_key(db, collection);
-        let data =
-            serde_json::to_vec(schema).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec(schema)?;
         self.meta_engine.put(META_TABLE, &key, &data)?;
-        Ok(Ok(()))
+        Ok(())
     }
 
     pub fn get_schema(
         &self,
         db: &str,
         collection: &str,
-    ) -> io::Result<Result<Option<CollectionSchema>, String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
-        Ok(Ok(self.get_schema_internal(db, collection)))
+    ) -> Result<Option<CollectionSchema>, VantaError> {
+        self.require_db(db)?;
+        Ok(self.get_schema_internal(db, collection))
     }
 
-    pub fn drop_schema(
-        &self,
-        db: &str,
-        collection: &str,
-    ) -> io::Result<Result<(), String>> {
-        if !self.database_exists(db) {
-            return Ok(Err(format!("Database '{}' not found", db)));
-        }
+    pub fn drop_schema(&self, db: &str, collection: &str) -> Result<(), VantaError> {
+        self.require_db(db)?;
         let key = Self::schema_meta_key(db, collection);
         self.meta_engine.delete(META_TABLE, &key)?;
-        Ok(Ok(()))
+        Ok(())
     }
 
     fn get_schema_internal(&self, db: &str, collection: &str) -> Option<CollectionSchema> {
@@ -720,7 +663,7 @@ impl DatabaseManager {
         serde_json::from_slice(&data).ok()
     }
 
-    // ─── Transaction operations ──────────────────────
+    // ---- Transaction operations ------------------------------
 
     pub fn begin_transaction(&self) -> String {
         self.tx_manager.begin()
@@ -732,7 +675,7 @@ impl DatabaseManager {
         db: String,
         collection: String,
         document: Value,
-    ) -> Result<(), String> {
+    ) -> Result<(), VantaError> {
         self.tx_manager.add_op(
             tx_id,
             TransactionOp::Insert {
@@ -750,7 +693,7 @@ impl DatabaseManager {
         collection: String,
         id: String,
         patch: Value,
-    ) -> Result<(), String> {
+    ) -> Result<(), VantaError> {
         self.tx_manager.add_op(
             tx_id,
             TransactionOp::Update {
@@ -768,7 +711,7 @@ impl DatabaseManager {
         db: String,
         collection: String,
         id: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), VantaError> {
         self.tx_manager.add_op(
             tx_id,
             TransactionOp::Delete {
@@ -779,11 +722,8 @@ impl DatabaseManager {
         )
     }
 
-    pub fn commit_transaction(&self, tx_id: &str) -> io::Result<Result<(), String>> {
-        let tx = match self.tx_manager.take(tx_id) {
-            Ok(t) => t,
-            Err(e) => return Ok(Err(e)),
-        };
+    pub fn commit_transaction(&self, tx_id: &str) -> Result<(), VantaError> {
+        let tx = self.tx_manager.take(tx_id)?;
 
         for op in tx.ops {
             match op {
@@ -792,10 +732,7 @@ impl DatabaseManager {
                     collection,
                     document,
                 } => {
-                    match self.insert(&db, &collection, document)? {
-                        Ok(_) => {}
-                        Err(e) => return Ok(Err(format!("Transaction insert failed: {}", e))),
-                    }
+                    self.insert(&db, &collection, document)?;
                 }
                 TransactionOp::Update {
                     db,
@@ -803,50 +740,42 @@ impl DatabaseManager {
                     id,
                     patch,
                 } => {
-                    match self.update_by_id(&db, &collection, &id, patch)? {
-                        Ok(_) => {}
-                        Err(e) => return Ok(Err(format!("Transaction update failed: {}", e))),
-                    }
+                    self.update_by_id(&db, &collection, &id, patch)?;
                 }
                 TransactionOp::Delete {
                     db,
                     collection,
                     id,
                 } => {
-                    match self.delete_by_id(&db, &collection, &id)? {
-                        Ok(_) => {}
-                        Err(e) => return Ok(Err(format!("Transaction delete failed: {}", e))),
-                    }
+                    self.delete_by_id(&db, &collection, &id)?;
                 }
             }
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
-    pub fn rollback_transaction(&self, tx_id: &str) -> Result<(), String> {
+    pub fn rollback_transaction(&self, tx_id: &str) -> Result<(), VantaError> {
         self.tx_manager.rollback(tx_id)
     }
 
-    // ─── Internal helpers ────────────────────────────
+    // ---- Internal helpers ------------------------------------
 
     fn update_meta_collections<F: FnOnce(&mut Vec<String>)>(
         &self,
         db: &str,
         f: F,
-    ) -> io::Result<()> {
+    ) -> Result<(), VantaError> {
         if let Some(data) = self.meta_engine.get(META_TABLE, db) {
-            let mut meta: DbMeta = bincode::deserialize(&data)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let mut meta: DbMeta = bincode::deserialize(&data)?;
             f(&mut meta.collections);
-            let new_data = bincode::serialize(&meta)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let new_data = bincode::serialize(&meta)?;
             self.meta_engine.put(META_TABLE, db, &new_data)?;
         }
         Ok(())
     }
 }
 
-// ─── Update patch application ────────────────────────
+// ---- Update patch application ----------------------------
 
 /// Apply an update patch to a document.
 ///
@@ -857,13 +786,13 @@ impl DatabaseManager {
 ///   {"$inc": {"field": 1}}         - increment numeric fields
 ///   {"$push": {"field": "value"}}  - push to array
 ///   {"$pull": {"field": "value"}}  - remove from array
-pub fn apply_update(doc: &mut Value, patch: &Value) -> Result<(), String> {
-    let doc_obj = doc
-        .as_object_mut()
-        .ok_or_else(|| "Document must be an object".to_string())?;
-    let patch_obj = patch
-        .as_object()
-        .ok_or_else(|| "Update patch must be an object".to_string())?;
+pub fn apply_update(doc: &mut Value, patch: &Value) -> Result<(), VantaError> {
+    let doc_obj = doc.as_object_mut().ok_or_else(|| VantaError::ValidationFailed {
+        errors: vec!["Document must be an object".to_string()],
+    })?;
+    let patch_obj = patch.as_object().ok_or_else(|| VantaError::ValidationFailed {
+        errors: vec!["Update patch must be an object".to_string()],
+    })?;
 
     let has_operators = patch_obj.keys().any(|k| k.starts_with('$'));
 
@@ -936,7 +865,11 @@ pub fn apply_update(doc: &mut Value, patch: &Value) -> Result<(), String> {
                     }
                 }
             }
-            _ => return Err(format!("Unknown update operator: {}", op)),
+            _ => {
+                return Err(VantaError::ValidationFailed {
+                    errors: vec![format!("Unknown update operator: {}", op)],
+                })
+            }
         }
     }
 
