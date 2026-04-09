@@ -5,6 +5,8 @@ use crate::auth::{AuthManager, CertManager, Role};
 use crate::db::{CollectionSchema, DatabaseManager, QueryOptions, VantaError};
 use super::auth_interceptor::{extract_auth, extract_auth_from_metadata};
 use super::proto;
+use super::lockout::LockoutTracker;
+use super::rate_limit::{GlobalRateLimiter, RateLimiter};
 use super::session::JwtSessionManager;
 
 // ---- VantaAuth Service ---------------------------------------
@@ -13,6 +15,9 @@ pub struct VantaAuthServiceImpl {
     pub auth_manager: Arc<AuthManager>,
     pub jwt_manager: Arc<JwtSessionManager>,
     pub cert_manager: Arc<CertManager>,
+    pub lockout_tracker: Arc<LockoutTracker>,
+    pub global_auth_limiter: Arc<GlobalRateLimiter>,
+    pub ip_auth_limiter: Arc<RateLimiter>,
 }
 
 #[tonic::async_trait]
@@ -21,19 +26,48 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::AuthRequest>,
     ) -> Result<Response<proto::AuthResponse>, Status> {
+        // Rate limiting: global + per-IP
+        if !self.global_auth_limiter.allow() {
+            return Err(Status::resource_exhausted("Rate limit exceeded, try again later"));
+        }
+
+        let peer_ip = request.remote_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if !self.ip_auth_limiter.allow(&peer_ip) {
+            return Err(Status::resource_exhausted("Too many auth attempts from this address"));
+        }
+
         let req = request.into_inner();
-        let auth = Arc::clone(&self.auth_manager);
         let username = req.username;
+
+        // Lockout check
+        if let Some(remaining) = self.lockout_tracker.check(&username) {
+            return Ok(Response::new(proto::AuthResponse {
+                success: false,
+                token: String::new(),
+                role: String::new(),
+                error: format!(
+                    "Account locked, try again in {} seconds",
+                    remaining.as_secs()
+                ),
+            }));
+        }
+
+        let auth = Arc::clone(&self.auth_manager);
+        let user_clone = username.clone();
         let password = req.password;
 
         let result = tokio::task::spawn_blocking(move || {
-            auth.authenticate(&username, &password)
+            auth.authenticate(&user_clone, &password)
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
             Ok(Some(user)) => {
+                self.lockout_tracker.clear(&username);
                 let token = self
                     .jwt_manager
                     .create_token(&user.username, &user.role);
@@ -44,12 +78,15 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
                     error: String::new(),
                 }))
             }
-            Ok(None) => Ok(Response::new(proto::AuthResponse {
-                success: false,
-                token: String::new(),
-                role: String::new(),
-                error: "Invalid credentials".into(),
-            })),
+            Ok(None) => {
+                self.lockout_tracker.record_failure(&username);
+                Ok(Response::new(proto::AuthResponse {
+                    success: false,
+                    token: String::new(),
+                    role: String::new(),
+                    error: "Invalid credentials".into(),
+                }))
+            }
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
