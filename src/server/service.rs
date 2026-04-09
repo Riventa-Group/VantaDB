@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-use crate::auth::{AuthManager, Role};
+use crate::auth::{AuthManager, CertManager, Role};
 use crate::db::{CollectionSchema, DatabaseManager, QueryOptions, VantaError};
 use super::auth_interceptor::{extract_auth, extract_auth_from_metadata};
 use super::proto;
@@ -12,6 +12,7 @@ use super::session::SessionStore;
 pub struct VantaAuthServiceImpl {
     pub auth_manager: Arc<AuthManager>,
     pub session_store: Arc<SessionStore>,
+    pub cert_manager: Arc<CertManager>,
 }
 
 #[tonic::async_trait]
@@ -187,6 +188,108 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
             })),
             Err(e) => Err(Status::internal(e.to_string())),
         }
+    }
+
+    // ---- Certificate management ---------------------------------
+
+    async fn issue_cert(
+        &self,
+        request: Request<proto::IssueCertRequest>,
+    ) -> Result<Response<proto::IssueCertResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let req = request.into_inner();
+        let cm = Arc::clone(&self.cert_manager);
+        let username = req.username;
+
+        let result = tokio::task::spawn_blocking(move || cm.issue_cert(&username))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        match result {
+            Ok((cert_pem, key_pem, serial)) => {
+                let ca_pem = self.cert_manager.ca_cert_pem().to_string();
+                Ok(Response::new(proto::IssueCertResponse {
+                    success: true,
+                    cert_pem,
+                    key_pem,
+                    ca_pem,
+                    serial,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(proto::IssueCertResponse {
+                success: false,
+                cert_pem: String::new(),
+                key_pem: String::new(),
+                ca_pem: String::new(),
+                serial: String::new(),
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn revoke_cert(
+        &self,
+        request: Request<proto::RevokeCertRequest>,
+    ) -> Result<Response<proto::StatusResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let req = request.into_inner();
+        let cm = Arc::clone(&self.cert_manager);
+        let serial = req.serial;
+
+        let result = tokio::task::spawn_blocking(move || cm.revoke_cert(&serial))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        match result {
+            Ok(true) => ok_status(),
+            Ok(false) => err_status("Certificate not found".to_string()),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+
+    async fn list_certs(
+        &self,
+        request: Request<proto::Empty>,
+    ) -> Result<Response<proto::ListCertsResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let cm = Arc::clone(&self.cert_manager);
+        let certs = tokio::task::spawn_blocking(move || cm.list_certs())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let cert_msgs: Vec<proto::CertInfoMsg> = certs
+            .into_iter()
+            .map(|c| proto::CertInfoMsg {
+                serial: c.serial,
+                username: c.username,
+                issued_at: c.issued_at,
+                revoked: c.revoked,
+            })
+            .collect();
+
+        Ok(Response::new(proto::ListCertsResponse { certs: cert_msgs }))
+    }
+
+    async fn get_ca_cert(
+        &self,
+        _request: Request<proto::Empty>,
+    ) -> Result<Response<proto::CaCertResponse>, Status> {
+        // CA cert is public — no auth required
+        let ca_pem = self.cert_manager.ca_cert_pem().to_string();
+        Ok(Response::new(proto::CaCertResponse { ca_pem }))
     }
 }
 
