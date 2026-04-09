@@ -29,7 +29,7 @@ libc = "0.2"
 dashmap = "5"
 ahash = "0.8"
 mimalloc = { version = "0.1", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tonic = "0.12"
 prost = "0.13"
 regex = "1"
