@@ -12,7 +12,8 @@ use crate::storage::StorageEngine;
 use super::aggregation;
 use super::error::VantaError;
 use super::filter::matches_filter;
-use super::index::{IndexDef, IndexManager};
+use super::index::{IndexDef, IndexManager, IndexType};
+use super::planner::{self, QueryPlan};
 use super::schema::CollectionSchema;
 use super::transaction::{TransactionManager, TransactionOp};
 
@@ -112,7 +113,7 @@ impl DatabaseManager {
         if !meta_engine.table_exists(META_TABLE) {
             meta_engine.create_table(META_TABLE)?;
         }
-        Ok(Self {
+        let manager = Self {
             base_path: base_path.to_path_buf(),
             meta_engine,
             engines: DashMap::with_hasher(RandomState::new()),
@@ -120,7 +121,53 @@ impl DatabaseManager {
             tx_manager: TransactionManager::new(),
             db_locks: DashMap::with_hasher(RandomState::new()),
             global_ddl_lock: RwLock::new(()),
-        })
+        };
+
+        // Rebuild persisted indexes on startup (#22)
+        manager.rebuild_indexes();
+
+        Ok(manager)
+    }
+
+    /// Rebuild all persisted indexes from meta engine on startup.
+    fn rebuild_indexes(&self) {
+        let index_keys: Vec<String> = self
+            .meta_engine
+            .list_keys(META_TABLE)
+            .into_iter()
+            .filter(|k| k.starts_with("_idx:"))
+            .collect();
+
+        for key in index_keys {
+            if let Some(data) = self.meta_engine.get(META_TABLE, &key) {
+                if let Ok(def) = serde_json::from_slice::<IndexDef>(&data) {
+                    // Parse "db:collection:field" from "_idx:db:col:field"
+                    let parts: Vec<&str> = key.splitn(4, ':').collect();
+                    if parts.len() >= 3 {
+                        let db = parts[1];
+                        let col = parts[2];
+                        if let Ok(engine) = self.db_engine(db) {
+                            let docs = Self::load_doc_pairs(&engine, col);
+                            let idx_key = Self::idx_key(db, col);
+                            self.index_manager.add_index(&idx_key, def, &docs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load all documents from a collection as (id, Value) pairs.
+    fn load_doc_pairs(engine: &StorageEngine, collection: &str) -> Vec<(String, Value)> {
+        engine
+            .list_keys(collection)
+            .into_iter()
+            .filter_map(|key| {
+                let data = engine.get(collection, &key)?;
+                let doc: Value = serde_json::from_slice(&data).ok()?;
+                Some((key, doc))
+            })
+            .collect()
     }
 
     /// Get or open a cached StorageEngine for a database (#8).
@@ -362,6 +409,28 @@ impl DatabaseManager {
         field: &str,
         value: &Value,
     ) -> Result<Vec<Value>, VantaError> {
+        self.require_db(db)?;
+
+        // Try index lookup first (#17)
+        let idx_key = Self::idx_key(db, collection);
+        if let Some(idx) = self.index_manager.get_index(&idx_key, field) {
+            let engine = self.db_engine(db)?;
+            let ids = idx.lookup_eq(value);
+            let mut docs = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(data) = engine.get(collection, id) {
+                    if let Ok(doc) = serde_json::from_slice::<Value>(&data) {
+                        // Double-check in case of stale index entry
+                        if doc.get(field) == Some(value) {
+                            docs.push(doc);
+                        }
+                    }
+                }
+            }
+            return Ok(docs);
+        }
+
+        // Fallback: full scan
         let docs = self.find_all(db, collection)?;
         let filtered: Vec<Value> = docs
             .into_iter()
@@ -518,12 +587,47 @@ impl DatabaseManager {
         filter: &Value,
         opts: &QueryOptions,
     ) -> Result<(Vec<Value>, usize), VantaError> {
-        let all = self.find_all(db, collection)?;
+        self.require_db(db)?;
+        let engine = self.db_engine(db)?;
 
-        let filtered: Vec<Value> = all
-            .into_iter()
-            .filter(|doc| matches_filter(doc, filter))
-            .collect();
+        let idx_key = Self::idx_key(db, collection);
+        let indexes = self.index_manager.get_all_indexes(&idx_key);
+        let plan = planner::plan_query(filter, &indexes);
+
+        let filtered = match plan {
+            QueryPlan::FullScan => {
+                // Fallback: scan all documents
+                let all = self.find_all(db, collection)?;
+                all.into_iter()
+                    .filter(|doc| matches_filter(doc, filter))
+                    .collect()
+            }
+            QueryPlan::IndexScan {
+                index,
+                predicate,
+                residual_filter,
+            } => {
+                // Use index to get candidate doc IDs
+                let candidate_ids = planner::execute_index_scan(index.as_ref(), &predicate);
+                let mut docs = Vec::with_capacity(candidate_ids.len());
+
+                for id in &candidate_ids {
+                    if let Some(data) = engine.get(collection, id) {
+                        if let Ok(doc) = serde_json::from_slice::<Value>(&data) {
+                            // Apply residual filter if any
+                            let passes = match &residual_filter {
+                                Some(rf) => matches_filter(&doc, rf),
+                                None => true,
+                            };
+                            if passes {
+                                docs.push(doc);
+                            }
+                        }
+                    }
+                }
+                docs
+            }
+        };
 
         Ok(opts.apply(filtered))
     }
@@ -546,8 +650,22 @@ impl DatabaseManager {
                 .unwrap_or_default()
         };
 
-        aggregation::execute_pipeline(docs, pipeline, &resolver)
-            .map_err(|e| VantaError::Internal(e))
+        // Per-value index lookup closure for $lookup optimization (#19)
+        let db_for_lookup = db.to_string();
+        let lookup_index_fn =
+            move |foreign_col: &str, field: &str, value: &Value| -> Option<Vec<String>> {
+                let idx_key = Self::idx_key(&db_for_lookup, foreign_col);
+                let idx = self.index_manager.get_index(&idx_key, field)?;
+                Some(idx.lookup_eq(value))
+            };
+
+        aggregation::execute_pipeline_with_indexes(
+            docs,
+            pipeline,
+            &resolver,
+            &lookup_index_fn,
+        )
+        .map_err(|e| VantaError::Internal(e))
     }
 
     // ---- Index operations ------------------------------------
@@ -558,6 +676,17 @@ impl DatabaseManager {
         collection: &str,
         field: &str,
         unique: bool,
+    ) -> Result<(), VantaError> {
+        self.create_index_typed(db, collection, field, unique, IndexType::BTree)
+    }
+
+    pub fn create_index_typed(
+        &self,
+        db: &str,
+        collection: &str,
+        field: &str,
+        unique: bool,
+        index_type: IndexType,
     ) -> Result<(), VantaError> {
         self.require_db(db)?;
 
@@ -572,20 +701,14 @@ impl DatabaseManager {
         }
 
         // Load all docs to build the index
-        let docs = self.find_all(db, collection)?;
-
-        let doc_pairs: Vec<(String, Value)> = docs
-            .into_iter()
-            .filter_map(|d| {
-                let id = d.get("_id")?.as_str()?.to_string();
-                Some((id, d))
-            })
-            .collect();
+        let engine = self.db_engine(db)?;
+        let doc_pairs = Self::load_doc_pairs(&engine, collection);
 
         let def = IndexDef {
             collection: key.clone(),
             field: field.to_string(),
             unique,
+            index_type,
         };
 
         self.index_manager.add_index(&key, def.clone(), &doc_pairs);
