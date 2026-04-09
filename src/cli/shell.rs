@@ -4,15 +4,6 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-#[cfg(unix)]
-fn is_running_as_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_running_as_root() -> bool {
-    false
-}
 
 use crate::auth::{AuthManager, Role, User};
 use crate::cli::handler;
@@ -123,65 +114,35 @@ impl Shell {
 
         let username = username.trim().to_string();
 
-        if username == "root" {
-            // Root login requires running as system root (sudo)
-            if !is_running_as_root() {
+        let password = Password::new()
+            .with_prompt(format!("  {} {}", "▸".truecolor(120, 80, 255), "Password"))
+            .interact()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        match auth.authenticate(&username, &password)? {
+            Some(user) => {
+                println!();
+                let role_display = if user.role.is_root() {
+                    "(superuser)".to_string()
+                } else {
+                    format!("({})", user.role)
+                };
+                println!(
+                    "  {} Authenticated as {} {}",
+                    "✓".green().bold(),
+                    user.username.bold().cyan(),
+                    role_display.dimmed()
+                );
+                Ok(Some(user))
+            }
+            None => {
                 println!();
                 println!(
                     "  {} {}",
                     "✗".red().bold(),
-                    "Root login requires elevated privileges. Run with sudo.".red()
+                    "Invalid username or password".red()
                 );
-                println!(
-                    "  {} {}",
-                    "ℹ".truecolor(120, 80, 255),
-                    "sudo vantadb --login".dimmed()
-                );
-                return Ok(None);
-            }
-
-            match auth.authenticate("root", "")? {
-                Some(user) => {
-                    println!();
-                    println!(
-                        "  {} Authenticated as {} {}",
-                        "✓".green().bold(),
-                        "root".bold().truecolor(255, 180, 50),
-                        "(superuser)".dimmed()
-                    );
-                    Ok(Some(user))
-                }
-                None => {
-                    println!("  {} {}", "✗".red().bold(), "Authentication failed".red());
-                    Ok(None)
-                }
-            }
-        } else {
-            let password = Password::new()
-                .with_prompt(format!("  {} {}", "▸".truecolor(120, 80, 255), "Password"))
-                .interact()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            match auth.authenticate(&username, &password)? {
-                Some(user) => {
-                    println!();
-                    println!(
-                        "  {} Authenticated as {} {}",
-                        "✓".green().bold(),
-                        user.username.bold().cyan(),
-                        format!("({})", user.role).dimmed()
-                    );
-                    Ok(Some(user))
-                }
-                None => {
-                    println!();
-                    println!(
-                        "  {} {}",
-                        "✗".red().bold(),
-                        "Invalid username or password".red()
-                    );
-                    Ok(None)
-                }
+                Ok(None)
             }
         }
     }
