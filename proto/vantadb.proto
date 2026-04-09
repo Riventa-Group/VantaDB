@@ -19,6 +19,11 @@ service VantaAuth {
   rpc RevokeCert   (RevokeCertRequest) returns (StatusResponse);
   rpc ListCerts    (Empty)             returns (ListCertsResponse);
   rpc GetCaCert    (Empty)             returns (CaCertResponse);
+
+  // ACL management
+  rpc SetAcl       (SetAclRequest)     returns (StatusResponse);
+  rpc GetAcl       (GetAclRequest)     returns (GetAclResponse);
+  rpc DeleteAcl    (DeleteAclRequest)  returns (StatusResponse);
 }
 
 // ─── Database Service ────────────────────────
@@ -159,6 +164,39 @@ message CertInfoMsg {
 
 message CaCertResponse {
   string ca_pem = 1;
+}
+
+// ─── ACL messages ────────────────────────────
+
+message SetAclRequest {
+  string username   = 1;
+  string database   = 2;
+  string collection = 3;  // empty = database-level ACL
+  string permission = 4;  // "none", "readonly", "readwrite", "admin"
+}
+
+message GetAclRequest {
+  string username = 1;
+}
+
+message GetAclResponse {
+  bool                found     = 1;
+  repeated DatabaseAclMsg databases = 2;
+}
+
+message DatabaseAclMsg {
+  string                    database    = 1;
+  string                    permission  = 2;
+  repeated CollectionAclMsg collections = 3;
+}
+
+message CollectionAclMsg {
+  string collection = 1;
+  string permission = 2;
+}
+
+message DeleteAclRequest {
+  string username = 1;
 }
 
 // ─── Database messages ───────────────────────

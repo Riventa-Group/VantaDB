@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-use crate::auth::{AuthManager, CertManager, Role};
+use crate::auth::{AclManager, AuthManager, CertManager, Permission, Role};
 use crate::db::{CollectionSchema, DatabaseManager, QueryOptions, VantaError};
-use super::auth_interceptor::{extract_auth, extract_auth_from_metadata};
+use super::auth_interceptor::{extract_auth, extract_auth_from_metadata, AuthContext};
 use super::proto;
 use super::lockout::LockoutTracker;
 use super::rate_limit::{GlobalRateLimiter, RateLimiter};
@@ -15,6 +15,7 @@ pub struct VantaAuthServiceImpl {
     pub auth_manager: Arc<AuthManager>,
     pub jwt_manager: Arc<JwtSessionManager>,
     pub cert_manager: Arc<CertManager>,
+    pub acl_manager: Arc<AclManager>,
     pub lockout_tracker: Arc<LockoutTracker>,
     pub global_auth_limiter: Arc<GlobalRateLimiter>,
     pub ip_auth_limiter: Arc<RateLimiter>,
@@ -328,17 +329,144 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         let ca_pem = self.cert_manager.ca_cert_pem().to_string();
         Ok(Response::new(proto::CaCertResponse { ca_pem }))
     }
+
+    // ---- ACL management -----------------------------------------
+
+    async fn set_acl(
+        &self,
+        request: Request<proto::SetAclRequest>,
+    ) -> Result<Response<proto::StatusResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let req = request.into_inner();
+        let permission = Permission::from_str(&req.permission)
+            .ok_or_else(|| Status::invalid_argument(format!("Invalid permission '{}'", req.permission)))?;
+
+        let acl = Arc::clone(&self.acl_manager);
+        let username = req.username;
+        let database = req.database;
+        let collection = req.collection;
+
+        let result = tokio::task::spawn_blocking(move || {
+            if collection.is_empty() {
+                acl.set_database_permission(&username, &database, permission)
+            } else {
+                acl.set_collection_permission(&username, &database, &collection, permission)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        result.map_err(|e| Status::internal(e.to_string()))?;
+        ok_status()
+    }
+
+    async fn get_acl(
+        &self,
+        request: Request<proto::GetAclRequest>,
+    ) -> Result<Response<proto::GetAclResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        let req = request.into_inner();
+
+        if req.username != ctx.username && !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let acl = Arc::clone(&self.acl_manager);
+        let username = req.username;
+
+        let result = tokio::task::spawn_blocking(move || acl.get_user_acl(&username))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        match result {
+            Some(user_acl) => {
+                let databases: Vec<proto::DatabaseAclMsg> = user_acl
+                    .databases
+                    .into_iter()
+                    .map(|db| proto::DatabaseAclMsg {
+                        database: db.database,
+                        permission: db.permission.to_string(),
+                        collections: db.collections.into_iter().map(|c| proto::CollectionAclMsg {
+                            collection: c.collection,
+                            permission: c.permission.to_string(),
+                        }).collect(),
+                    })
+                    .collect();
+                Ok(Response::new(proto::GetAclResponse {
+                    found: true,
+                    databases,
+                }))
+            }
+            None => Ok(Response::new(proto::GetAclResponse {
+                found: false,
+                databases: vec![],
+            })),
+        }
+    }
+
+    async fn delete_acl(
+        &self,
+        request: Request<proto::DeleteAclRequest>,
+    ) -> Result<Response<proto::StatusResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let req = request.into_inner();
+        let acl = Arc::clone(&self.acl_manager);
+        let username = req.username;
+
+        tokio::task::spawn_blocking(move || acl.delete_user_acl(&username))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        ok_status()
+    }
 }
 
 // ---- VantaDb Service -----------------------------------------
 
 pub struct VantaDbServiceImpl {
     pub db_manager: Arc<DatabaseManager>,
+    pub acl_manager: Arc<AclManager>,
 }
 
 /// Helper to convert VantaError to gRPC Status
 fn vanta_err(e: VantaError) -> Status {
     e.to_grpc_status()
+}
+
+fn require_read(acl: &AclManager, ctx: &AuthContext, db: &str, col: Option<&str>) -> Result<(), Status> {
+    let perm = acl.resolve(&ctx.username, &ctx.role, db, col);
+    if perm.can_read() {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Read permission denied"))
+    }
+}
+
+fn require_write(acl: &AclManager, ctx: &AuthContext, db: &str, col: Option<&str>) -> Result<(), Status> {
+    let perm = acl.resolve(&ctx.username, &ctx.role, db, col);
+    if perm.can_write() {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Write permission denied"))
+    }
+}
+
+fn require_admin(acl: &AclManager, ctx: &AuthContext, db: &str, col: Option<&str>) -> Result<(), Status> {
+    let perm = acl.resolve(&ctx.username, &ctx.role, db, col);
+    if perm.can_admin() {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Admin permission denied"))
+    }
 }
 
 #[tonic::async_trait]
@@ -350,11 +478,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::DatabaseRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_admin() {
-            return Err(Status::permission_denied("Admin role required"));
-        }
-
         let req = request.into_inner();
+        require_admin(&self.acl_manager, &ctx, &req.database, None)?;
+
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
 
@@ -371,11 +497,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::DatabaseRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_admin() {
-            return Err(Status::permission_denied("Admin role required"));
-        }
-
         let req = request.into_inner();
+        require_admin(&self.acl_manager, &ctx, &req.database, None)?;
+
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
 
@@ -409,11 +533,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::CollectionRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, None)?;
+
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -431,11 +553,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::CollectionRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_admin() {
-            return Err(Status::permission_denied("Admin role required"));
-        }
-
         let req = request.into_inner();
+        require_admin(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
+
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -452,9 +572,10 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::DatabaseRequest>,
     ) -> Result<Response<proto::ListCollectionsResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, None)?;
+
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
 
@@ -473,11 +594,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::InsertRequest>,
     ) -> Result<Response<proto::InsertResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let doc: serde_json::Value = serde_json::from_str(&req.document_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
 
@@ -511,9 +629,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::FindByIdRequest>,
     ) -> Result<Response<proto::DocumentResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -546,9 +664,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::FindAllRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let opts = to_query_options(req.pagination, req.sort);
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
@@ -566,9 +684,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::FindWhereRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let value: serde_json::Value = serde_json::from_str(&req.value_json)
             .unwrap_or(serde_json::Value::String(req.value_json.clone()));
 
@@ -594,11 +712,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::DeleteByIdRequest>,
     ) -> Result<Response<proto::DeleteResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -626,9 +741,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::CountRequest>,
     ) -> Result<Response<proto::CountResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -651,11 +766,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::UpdateRequest>,
     ) -> Result<Response<proto::UpdateResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let patch: serde_json::Value = serde_json::from_str(&req.patch_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
 
@@ -688,11 +800,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::UpdateWhereRequest>,
     ) -> Result<Response<proto::UpdateResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let filter: serde_json::Value = serde_json::from_str(&req.filter_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid filter JSON: {}", e)))?;
         let patch: serde_json::Value = serde_json::from_str(&req.patch_json)
@@ -727,9 +836,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::QueryRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let filter: serde_json::Value = serde_json::from_str(&req.filter_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid filter JSON: {}", e)))?;
 
@@ -753,9 +862,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::AggregateRequest>,
     ) -> Result<Response<proto::AggregateResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let pipeline: Vec<serde_json::Value> = serde_json::from_str(&req.pipeline_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid pipeline JSON: {}", e)))?;
 
@@ -793,11 +902,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::IndexRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -817,11 +923,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::IndexRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_admin() {
-            return Err(Status::permission_denied("Admin role required"));
-        }
-
         let req = request.into_inner();
+        require_admin(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -839,9 +942,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::ListIndexesRequest>,
     ) -> Result<Response<proto::ListIndexesResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -868,11 +971,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::SetSchemaRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_admin() {
-            return Err(Status::permission_denied("Admin role required"));
-        }
-
         let req = request.into_inner();
+        require_admin(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let schema_val: serde_json::Value = serde_json::from_str(&req.schema_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid schema JSON: {}", e)))?;
         let schema = CollectionSchema::from_json(&schema_val)
@@ -894,9 +994,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::GetSchemaRequest>,
     ) -> Result<Response<proto::GetSchemaResponse>, Status> {
-        let _ctx = extract_auth(&request)?;
-
+        let ctx = extract_auth(&request)?;
         let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -927,11 +1027,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::GetSchemaRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_admin() {
-            return Err(Status::permission_denied("Admin role required"));
-        }
-
         let req = request.into_inner();
+        require_admin(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -966,6 +1063,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::TxRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
+        // Commit checks role-level write since no specific db/collection is known
         if !ctx.role.can_write() {
             return Err(Status::permission_denied("Write permission required"));
         }
@@ -1005,11 +1103,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::TxInsertRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let doc: serde_json::Value = serde_json::from_str(&req.document_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
 
@@ -1031,11 +1126,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::TxUpdateRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let patch: serde_json::Value = serde_json::from_str(&req.patch_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid JSON: {}", e)))?;
 
@@ -1058,11 +1150,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::TxDeleteRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let ctx = extract_auth(&request)?;
-        if !ctx.role.can_write() {
-            return Err(Status::permission_denied("Write permission required"));
-        }
-
         let req = request.into_inner();
+        require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
         let tx_id = req.tx_id;
         let db = req.database;
