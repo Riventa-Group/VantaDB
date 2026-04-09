@@ -357,19 +357,23 @@ impl TransactionManager {
                     tx.held_locks
                         .push((collection.to_string(), doc_id.to_string()));
                 }
+                // Remove any stale wait-graph edges for this tx
+                self.wait_graph.remove_node(uuid);
                 Ok(())
             }
             Err(holder_uuid) => {
-                // Check for deadlock before waiting
+                // Check for deadlock: would adding waiter->holder create a cycle?
                 if self.wait_graph.would_deadlock(uuid, holder_uuid) {
                     return Err(VantaError::Deadlock {
                         tx_id: tx_id.to_string(),
                     });
                 }
-                // In a synchronous context, we can't block — return conflict
+                // Record the wait edge for future deadlock detection
+                self.wait_graph.add_edge(uuid, holder_uuid);
+                // Fail-immediate: client retries
                 Err(VantaError::TransactionConflict {
                     tx_id: tx_id.to_string(),
-                    reason: format!("Lock held by another transaction"),
+                    reason: "Lock held by another transaction".to_string(),
                 })
             }
         }
@@ -619,6 +623,51 @@ mod tests {
 
         // Clean up
         tm.rollback(&id1).unwrap();
+        tm.rollback(&id2).unwrap();
+    }
+
+    #[test]
+    fn test_deadlock_via_wait_graph_edges() {
+        let tm = TransactionManager::new();
+        let id1 = tm.begin_at(1);
+        let id2 = tm.begin_at(2);
+
+        // tx1 holds lock on A
+        tm.acquire_lock(&id1, "col", "A").unwrap();
+        // tx2 holds lock on B
+        tm.acquire_lock(&id2, "col", "B").unwrap();
+
+        // tx1 tries B → blocked, edge tx1->tx2 added to wait graph
+        let r1 = tm.acquire_lock(&id1, "col", "B");
+        assert!(matches!(r1, Err(VantaError::TransactionConflict { .. })));
+
+        // tx2 tries A → would create cycle tx2->tx1->tx2 → deadlock!
+        let r2 = tm.acquire_lock(&id2, "col", "A");
+        assert!(matches!(r2, Err(VantaError::Deadlock { .. })));
+
+        tm.rollback(&id1).unwrap();
+        tm.rollback(&id2).unwrap();
+    }
+
+    #[test]
+    fn test_no_deadlock_after_rollback() {
+        let tm = TransactionManager::new();
+        let id1 = tm.begin_at(1);
+        let id2 = tm.begin_at(2);
+
+        // tx1 holds A
+        tm.acquire_lock(&id1, "col", "A").unwrap();
+
+        // tx2 tries A → conflict, edge added
+        let r = tm.acquire_lock(&id2, "col", "A");
+        assert!(matches!(r, Err(VantaError::TransactionConflict { .. })));
+
+        // tx1 rolls back → releases lock and clears wait graph
+        tm.rollback(&id1).unwrap();
+
+        // tx2 can now acquire A (no deadlock, no conflict)
+        tm.acquire_lock(&id2, "col", "A").unwrap();
+
         tm.rollback(&id2).unwrap();
     }
 }

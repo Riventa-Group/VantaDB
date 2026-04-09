@@ -168,6 +168,20 @@ impl MVCCStore {
         keys
     }
 
+    /// Check if a key has any version created after the given version.
+    /// Used for read-set validation at commit time (serializable isolation).
+    pub fn has_write_after(&self, table: &str, key: &str, after_version: u64) -> bool {
+        let chain_key = (table.to_string(), key.to_string());
+        if let Some(chain) = self.chains.get(&chain_key) {
+            for mv in chain.iter() {
+                if mv.created_at > after_version {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Count live keys in a table at the latest version.
     pub fn count_latest(&self, table: &str) -> usize {
         let version = self.clock.current();
@@ -675,5 +689,21 @@ mod tests {
         let txn = Uuid::new_v4();
         let result = store.delete("test", "nope", txn).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_has_write_after() {
+        let (store, _dir) = test_store();
+        let txn = Uuid::new_v4();
+
+        let v1 = store.put("test", "k1", b"v1", txn).unwrap();
+        assert!(!store.has_write_after("test", "k1", v1));
+
+        let v2 = store.put("test", "k1", b"v2", txn).unwrap();
+        assert!(store.has_write_after("test", "k1", v1));
+        assert!(!store.has_write_after("test", "k1", v2));
+
+        // Non-existent key
+        assert!(!store.has_write_after("test", "nope", 0));
     }
 }
