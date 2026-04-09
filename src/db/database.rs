@@ -1,7 +1,11 @@
+use ahash::RandomState;
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::storage::StorageEngine;
@@ -95,8 +99,11 @@ struct DbMeta {
 pub struct DatabaseManager {
     base_path: PathBuf,
     meta_engine: StorageEngine,
+    engines: DashMap<String, Arc<StorageEngine>, RandomState>,
     pub index_manager: IndexManager,
     pub tx_manager: TransactionManager,
+    db_locks: DashMap<String, Arc<RwLock<()>>, RandomState>,
+    global_ddl_lock: RwLock<()>,
 }
 
 impl DatabaseManager {
@@ -108,13 +115,33 @@ impl DatabaseManager {
         Ok(Self {
             base_path: base_path.to_path_buf(),
             meta_engine,
+            engines: DashMap::with_hasher(RandomState::new()),
             index_manager: IndexManager::new(),
             tx_manager: TransactionManager::new(),
+            db_locks: DashMap::with_hasher(RandomState::new()),
+            global_ddl_lock: RwLock::new(()),
         })
     }
 
-    fn db_engine(&self, db_name: &str) -> io::Result<StorageEngine> {
-        StorageEngine::open(&self.base_path.join(db_name))
+    /// Get or open a cached StorageEngine for a database (#8).
+    /// Engines are cached for the lifetime of the DatabaseManager and only
+    /// evicted on drop_database.
+    fn db_engine(&self, db_name: &str) -> io::Result<Arc<StorageEngine>> {
+        if let Some(engine) = self.engines.get(db_name) {
+            return Ok(Arc::clone(engine.value()));
+        }
+        let engine = Arc::new(StorageEngine::open(&self.base_path.join(db_name))?);
+        self.engines.insert(db_name.to_string(), Arc::clone(&engine));
+        Ok(engine)
+    }
+
+    /// Acquire a shared (read) lock for DML operations on a database (#10).
+    fn db_read_lock(&self, db: &str) -> Arc<RwLock<()>> {
+        self.db_locks
+            .entry(db.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .value()
+            .clone()
     }
 
     fn idx_key(db: &str, collection: &str) -> String {
@@ -132,6 +159,7 @@ impl DatabaseManager {
     // ─── Database ops ────────────────────────────────
 
     pub fn create_database(&self, name: &str) -> io::Result<Result<(), String>> {
+        let _guard = self.global_ddl_lock.write();
         if self.meta_engine.get(META_TABLE, name).is_some() {
             return Ok(Err(format!("Database '{}' already exists", name)));
         }
@@ -147,6 +175,7 @@ impl DatabaseManager {
     }
 
     pub fn drop_database(&self, name: &str) -> io::Result<Result<(), String>> {
+        let _guard = self.global_ddl_lock.write();
         if self.meta_engine.get(META_TABLE, name).is_none() {
             return Ok(Err(format!("Database '{}' not found", name)));
         }
@@ -160,6 +189,9 @@ impl DatabaseManager {
             }
         }
         self.meta_engine.delete(META_TABLE, name)?;
+        // Evict cached engine
+        self.engines.remove(name);
+        self.db_locks.remove(name);
         let db_path = self.base_path.join(name);
         if db_path.exists() {
             std::fs::remove_dir_all(db_path)?;
@@ -182,6 +214,8 @@ impl DatabaseManager {
     // ─── Collection ops ──────────────────────────────
 
     pub fn create_collection(&self, db: &str, collection: &str) -> io::Result<Result<(), String>> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.write(); // exclusive DDL lock on this database (#10)
         if !self.database_exists(db) {
             return Ok(Err(format!("Database '{}' not found", db)));
         }
@@ -198,6 +232,8 @@ impl DatabaseManager {
     }
 
     pub fn drop_collection(&self, db: &str, collection: &str) -> io::Result<Result<(), String>> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.write(); // exclusive DDL lock on this database (#10)
         if !self.database_exists(db) {
             return Ok(Err(format!("Database '{}' not found", db)));
         }
@@ -240,6 +276,8 @@ impl DatabaseManager {
         collection: &str,
         document: Value,
     ) -> io::Result<Result<String, String>> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.read(); // shared DML lock — DDL blocked while active (#10)
         if !self.database_exists(db) {
             return Ok(Err(format!("Database '{}' not found", db)));
         }
@@ -376,6 +414,8 @@ impl DatabaseManager {
         collection: &str,
         id: &str,
     ) -> io::Result<Result<bool, String>> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.read();
         if !self.database_exists(db) {
             return Ok(Err(format!("Database '{}' not found", db)));
         }
@@ -415,6 +455,8 @@ impl DatabaseManager {
         id: &str,
         patch: Value,
     ) -> io::Result<Result<bool, String>> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.read();
         if !self.database_exists(db) {
             return Ok(Err(format!("Database '{}' not found", db)));
         }

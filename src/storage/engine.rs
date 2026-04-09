@@ -50,11 +50,40 @@ fn new_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V, RandomState> {
     DashMap::with_hasher(RandomState::new())
 }
 
+/// Encode a single WAL record (put or delete) into a buffer, appending a CRC32C checksum.
+///
+/// WAL record format:
+///   [op: 1B] [key_len: 4B LE] [key: var] [val_len: 4B LE (put only)] [value: var (put only)] [crc32c: 4B LE]
+///
+/// The CRC32C covers all bytes preceding it in the record.
+fn encode_wal_put(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    let start = buf.len();
+    buf.push(WAL_OP_PUT);
+    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buf.extend_from_slice(value);
+    let crc = crc32c::crc32c(&buf[start..]);
+    buf.extend_from_slice(&crc.to_le_bytes());
+}
+
+fn encode_wal_delete(buf: &mut Vec<u8>, key: &[u8]) {
+    let start = buf.len();
+    buf.push(WAL_OP_DELETE);
+    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    buf.extend_from_slice(key);
+    let crc = crc32c::crc32c(&buf[start..]);
+    buf.extend_from_slice(&crc.to_le_bytes());
+}
+
 /// Core storage engine: 256-shard DashMap + WAL-based persistence.
 ///
 /// Architecture:
 /// - 256-shard DashMap per table with ahash: near-linear write scaling across cores
 /// - Write-Ahead Log (WAL): O(1) append per write instead of O(n) full-table serialization
+/// - CRC32C checksums on every WAL record for crash-safety (fixes #2)
+/// - fsync/fdatasync after WAL writes to guarantee durability (fixes #1)
+/// - Atomic compaction via temp-file + rename + directory fsync (fixes #3, #4)
 /// - Arc<[u8]> values: zero-copy reads via refcount bump (~5ns vs ~50ns memcpy)
 /// - Deferred compaction: full snapshot written on compact(), not every put()
 #[derive(Clone)]
@@ -140,57 +169,103 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Replay WAL entries with CRC32C validation.
+    /// Records with invalid checksums are treated as torn writes and stop replay.
     fn replay_wal(map: &Table, path: &Path) -> io::Result<()> {
         let data = fs::read(path)?;
         let len = data.len();
         let mut pos = 0;
+
         while pos < len {
-            if pos >= len {
+            // We need at least: op(1) + key_len(4) + crc(4) = 9 bytes minimum
+            if pos + 9 > len {
                 break;
             }
+
             let op = data[pos];
-            pos += 1;
 
-            if pos + 4 > len {
+            // Determine record length for CRC validation before applying
+            let record_start = pos;
+            let mut scan = pos + 1; // past op byte
+
+            if scan + 4 > len {
                 break;
             }
-            let key_len =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                    as usize;
-            pos += 4;
+            let key_len = u32::from_le_bytes([
+                data[scan], data[scan + 1], data[scan + 2], data[scan + 3],
+            ]) as usize;
+            scan += 4;
 
-            if pos + key_len > len {
+            if scan + key_len > len {
                 break;
             }
-            let key = match std::str::from_utf8(&data[pos..pos + key_len]) {
-                Ok(s) => s.to_string(),
-                Err(_) => break,
-            };
-            pos += key_len;
+            scan += key_len; // past key
 
             match op {
                 WAL_OP_PUT => {
-                    if pos + 4 > len {
+                    if scan + 4 > len {
                         break;
                     }
                     let val_len = u32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
+                        data[scan], data[scan + 1], data[scan + 2], data[scan + 3],
                     ]) as usize;
-                    pos += 4;
-                    if pos + val_len > len {
+                    scan += 4;
+                    if scan + val_len > len {
                         break;
                     }
-                    map.insert(key, Arc::from(&data[pos..pos + val_len]));
-                    pos += val_len;
+                    scan += val_len; // past value
+                }
+                WAL_OP_DELETE => {
+                    // no value bytes for delete
+                }
+                _ => break, // unknown op, stop replay
+            }
+
+            // Now `scan` points to where the CRC32C should be
+            if scan + 4 > len {
+                break;
+            }
+            let stored_crc = u32::from_le_bytes([
+                data[scan], data[scan + 1], data[scan + 2], data[scan + 3],
+            ]);
+            let computed_crc = crc32c::crc32c(&data[record_start..scan]);
+
+            if stored_crc != computed_crc {
+                // Torn write or corruption — stop replay here (#2)
+                eprintln!(
+                    "WAL: CRC mismatch at offset {}, stopping replay (expected {:08x}, got {:08x})",
+                    record_start, stored_crc, computed_crc
+                );
+                break;
+            }
+
+            // CRC valid — apply the record
+            let mut apply_pos = record_start + 1; // skip op
+            apply_pos += 4; // skip key_len (already parsed)
+            let key = match std::str::from_utf8(&data[apply_pos..apply_pos + key_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            };
+            apply_pos += key_len;
+
+            match op {
+                WAL_OP_PUT => {
+                    apply_pos += 4; // skip val_len
+                    let val_len = u32::from_le_bytes([
+                        data[record_start + 1 + 4 + key_len],
+                        data[record_start + 1 + 4 + key_len + 1],
+                        data[record_start + 1 + 4 + key_len + 2],
+                        data[record_start + 1 + 4 + key_len + 3],
+                    ]) as usize;
+                    map.insert(key, Arc::from(&data[apply_pos..apply_pos + val_len]));
                 }
                 WAL_OP_DELETE => {
                     map.remove(&key);
                 }
-                _ => break, // corrupted entry, stop replay
+                _ => unreachable!(),
             }
+
+            pos = scan + 4; // advance past CRC
         }
         Ok(())
     }
@@ -210,36 +285,49 @@ impl StorageEngine {
         Ok(writer)
     }
 
+    /// Append a PUT record to the WAL with CRC32C checksum and fsync (#1, #2).
     #[inline(always)]
     fn wal_append_put(&self, table: &str, key: &str, value: &[u8]) -> io::Result<()> {
         let writer = self.get_wal_writer(table)?;
+        let mut buf = Vec::with_capacity(1 + 4 + key.len() + 4 + value.len() + 4);
+        encode_wal_put(&mut buf, key.as_bytes(), value);
         let mut w = writer.lock();
-        let kb = key.as_bytes();
-        w.write_all(&[WAL_OP_PUT])?;
-        w.write_all(&(kb.len() as u32).to_le_bytes())?;
-        w.write_all(kb)?;
-        w.write_all(&(value.len() as u32).to_le_bytes())?;
-        w.write_all(value)?;
+        w.write_all(&buf)?;
+        w.flush()?;
+        w.get_ref().sync_data()?;
         Ok(())
     }
 
+    /// Append a DELETE record to the WAL with CRC32C checksum and fsync (#1, #2).
     #[inline(always)]
     fn wal_append_delete(&self, table: &str, key: &str) -> io::Result<()> {
         let writer = self.get_wal_writer(table)?;
+        let mut buf = Vec::with_capacity(1 + 4 + key.len() + 4);
+        encode_wal_delete(&mut buf, key.as_bytes());
         let mut w = writer.lock();
-        let kb = key.as_bytes();
-        w.write_all(&[WAL_OP_DELETE])?;
-        w.write_all(&(kb.len() as u32).to_le_bytes())?;
-        w.write_all(kb)?;
+        w.write_all(&buf)?;
+        w.flush()?;
+        w.get_ref().sync_data()?;
         Ok(())
     }
 
-    /// Write full snapshot to disk and truncate WAL (compaction).
+    /// Write full snapshot to disk atomically and truncate WAL (#3, #4).
+    ///
+    /// Protocol:
+    /// 1. Flush and fsync WAL buffer
+    /// 2. Write snapshot to temp file (.vdb.tmp)
+    /// 3. Fsync the temp file
+    /// 4. Atomic rename temp -> final
+    /// 5. Fsync the directory (ensures rename is durable)
+    /// 6. Only now remove WAL (safe — snapshot is verified on disk)
     pub fn compact(&self, table: &str) -> io::Result<()> {
-        // Flush WAL buffer first
+        // 1. Flush WAL buffer and fsync
         if let Some(writer) = self.wal_writers.get(table) {
-            writer.lock().flush()?;
+            let mut w = writer.lock();
+            w.flush()?;
+            w.get_ref().sync_data()?;
         }
+
         if let Some(map_ref) = self.tables.get(table) {
             let entries: Vec<(String, Vec<u8>)> = map_ref
                 .iter()
@@ -248,9 +336,27 @@ impl StorageEngine {
             let table_file = TableFile { entries };
             let data = bincode::serialize(&table_file)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            fs::write(self.table_path(table), data)?;
+
+            let snapshot_path = self.table_path(table);
+            let tmp_path = snapshot_path.with_extension("vdb.tmp");
+
+            // 2. Write snapshot to temp file
+            fs::write(&tmp_path, &data)?;
+
+            // 3. Fsync the temp file
+            let f = File::open(&tmp_path)?;
+            f.sync_all()?;
+
+            // 4. Atomic rename
+            fs::rename(&tmp_path, &snapshot_path)?;
+
+            // 5. Fsync the directory
+            if let Ok(dir) = File::open(self.base_path.as_path()) {
+                let _ = dir.sync_all();
+            }
         }
-        // Remove WAL writer and file after successful snapshot
+
+        // 6. Only NOW safe to remove WAL — snapshot is verified on disk
         self.wal_writers.remove(table);
         let wal_path = self.wal_path(table);
         if wal_path.exists() {
@@ -259,15 +365,14 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Atomically get or create a table, eliminating the TOCTOU race (#9).
     #[inline(always)]
     fn get_or_create_table(&self, table: &str) -> Arc<Table> {
-        if let Some(t) = self.tables.get(table) {
-            Arc::clone(t.value())
-        } else {
-            let map = Arc::new(new_table(64));
-            self.tables.insert(table.to_string(), Arc::clone(&map));
-            map
-        }
+        self.tables
+            .entry(table.to_string())
+            .or_insert_with(|| Arc::new(new_table(64)))
+            .value()
+            .clone()
     }
 
     /// Insert with WAL persistence (append-only, no full flush).
@@ -309,23 +414,17 @@ impl StorageEngine {
     }
 
     pub fn create_table(&self, table: &str) -> io::Result<()> {
-        if !self.tables.contains_key(table) {
-            self.tables.insert(
-                table.to_string(),
-                Arc::new(new_table(64)),
-            );
-        }
+        self.tables
+            .entry(table.to_string())
+            .or_insert_with(|| Arc::new(new_table(64)));
         self.compact(table)
     }
 
     /// Create a table pre-allocated for `capacity` entries with 256 shards.
     pub fn create_table_with_capacity(&self, table: &str, capacity: usize) -> io::Result<()> {
-        if !self.tables.contains_key(table) {
-            self.tables.insert(
-                table.to_string(),
-                Arc::new(new_table(capacity)),
-            );
-        }
+        self.tables
+            .entry(table.to_string())
+            .or_insert_with(|| Arc::new(new_table(capacity)));
         self.compact(table)
     }
 
@@ -388,24 +487,22 @@ impl StorageEngine {
             .unwrap_or(false)
     }
 
-    /// Batch write to memory then single WAL append (much faster than individual puts).
+    /// Batch write to memory then single WAL append with fsync (much faster than individual puts).
     pub fn put_batch(&self, table: &str, entries: &[(String, Vec<u8>)]) -> io::Result<()> {
         let t = self.get_or_create_table(table);
         for (k, v) in entries {
             t.insert(k.clone(), Arc::from(v.as_slice()));
         }
-        // Write all entries to WAL in one locked section
+        // Encode all entries into a single buffer, write in one locked section
+        let mut buf = Vec::with_capacity(entries.len() * 128);
+        for (k, v) in entries {
+            encode_wal_put(&mut buf, k.as_bytes(), v);
+        }
         let writer = self.get_wal_writer(table)?;
         let mut w = writer.lock();
-        for (k, v) in entries {
-            let kb = k.as_bytes();
-            w.write_all(&[WAL_OP_PUT])?;
-            w.write_all(&(kb.len() as u32).to_le_bytes())?;
-            w.write_all(kb)?;
-            w.write_all(&(v.len() as u32).to_le_bytes())?;
-            w.write_all(v)?;
-        }
+        w.write_all(&buf)?;
         w.flush()?;
+        w.get_ref().sync_data()?;
         Ok(())
     }
 }
