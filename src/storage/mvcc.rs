@@ -125,6 +125,65 @@ impl MVCCStore {
         &self.clock
     }
 
+    /// Access the underlying StorageEngine (for table DDL, compaction, etc.).
+    pub fn engine(&self) -> &StorageEngine {
+        &self.engine
+    }
+
+    // ---- Delegated table operations ----------------------------
+
+    pub fn table_exists(&self, table: &str) -> bool {
+        self.engine.table_exists(table)
+    }
+
+    pub fn create_table(&self, table: &str) -> io::Result<()> {
+        self.engine.create_table(table)
+    }
+
+    pub fn drop_table(&self, table: &str) -> io::Result<bool> {
+        // Remove all MVCC chains for this table
+        self.chains.retain(|(t, _), _| t != table);
+        self.engine.drop_table(table)
+    }
+
+    pub fn list_tables(&self) -> Vec<String> {
+        self.engine.list_tables()
+    }
+
+    // ---- Latest-version convenience methods --------------------
+
+    /// List all live keys in a table at the latest version (no snapshot needed).
+    pub fn list_keys_latest(&self, table: &str) -> Vec<String> {
+        let version = self.clock.current();
+        let prefix = table.to_string();
+        let mut keys = Vec::new();
+        for entry in self.chains.iter() {
+            let (ref t, ref k) = *entry.key();
+            if t == &prefix {
+                if resolve_version(entry.value(), version).is_some() {
+                    keys.push(k.clone());
+                }
+            }
+        }
+        keys
+    }
+
+    /// Count live keys in a table at the latest version.
+    pub fn count_latest(&self, table: &str) -> usize {
+        let version = self.clock.current();
+        let prefix = table.to_string();
+        let mut count = 0;
+        for entry in self.chains.iter() {
+            let (ref t, _) = *entry.key();
+            if t == &prefix {
+                if resolve_version(entry.value(), version).is_some() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Take a consistent snapshot at the current version.
     pub fn snapshot(&self) -> Snapshot {
         let version = self.clock.current();
