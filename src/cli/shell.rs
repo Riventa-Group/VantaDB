@@ -30,9 +30,40 @@ pub struct Shell {
 
 impl Shell {
     pub fn data_dir() -> PathBuf {
-        dirs::home_dir()
+        if let Ok(dir) = std::env::var("VANTADB_DATA_DIR") {
+            return PathBuf::from(dir);
+        }
+        let new_path = dirs::data_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+            .join("vantadb");
+
+        // Warn if legacy path exists but new path doesn't
+        let legacy_path = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".vantadb")
+            .join(".vantadb");
+        if legacy_path.exists() && !new_path.exists() {
+            eprintln!(
+                "  {} Legacy data directory {} detected.",
+                "⚠".truecolor(255, 180, 50),
+                legacy_path.display()
+            );
+            eprintln!(
+                "    VantaDB now uses {}",
+                new_path.display()
+            );
+            eprintln!(
+                "    To migrate: mv {} {}",
+                legacy_path.display(),
+                new_path.display()
+            );
+        }
+
+        // Use legacy path if it exists and new path doesn't (backward compat)
+        if legacy_path.exists() && !new_path.exists() {
+            return legacy_path;
+        }
+
+        new_path
     }
 
     pub fn init() -> io::Result<(StorageEngine, AuthManager, DatabaseManager)> {

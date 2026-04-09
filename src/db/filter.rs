@@ -1,4 +1,33 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use serde_json::Value;
+
+/// Thread-local regex cache to avoid recompiling patterns on every filter evaluation.
+/// Simple LRU-style eviction: clear all when capacity exceeded.
+const REGEX_CACHE_CAPACITY: usize = 64;
+
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<String, regex::Regex>> = RefCell::new(HashMap::new());
+}
+
+pub fn cached_regex(pattern: &str) -> Option<regex::Regex> {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(pattern) {
+            return Some(re.clone());
+        }
+        if let Ok(re) = regex::Regex::new(pattern) {
+            if cache.len() >= REGEX_CACHE_CAPACITY {
+                cache.clear();
+            }
+            cache.insert(pattern.to_string(), re.clone());
+            Some(re)
+        } else {
+            None
+        }
+    })
+}
 
 /// Evaluate whether a document matches a filter expression.
 ///
@@ -117,7 +146,7 @@ fn match_operator(doc_value: Option<&Value>, op: &str, operand: &Value) -> bool 
             if let (Some(val), Some(pattern)) =
                 (doc_value.and_then(|v| v.as_str()), operand.as_str())
             {
-                regex::Regex::new(pattern)
+                cached_regex(pattern)
                     .map(|re| re.is_match(val))
                     .unwrap_or(false)
             } else {

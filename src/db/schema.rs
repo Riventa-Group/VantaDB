@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
+use super::filter::cached_regex;
+
 /// Schema definition for a collection, enforced on insert and update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
@@ -156,7 +158,7 @@ fn validate_field(def: &FieldDef, val: &Value) -> Result<(), Vec<String>> {
             }
         }
         if let Some(ref pattern) = def.pattern {
-            if let Ok(re) = regex::Regex::new(pattern) {
+            if let Some(re) = cached_regex(pattern) {
                 if !re.is_match(s) {
                     errors.push(format!(
                         "Field '{}': doesn't match pattern '{}'",
