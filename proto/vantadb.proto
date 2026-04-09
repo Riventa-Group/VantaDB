@@ -31,6 +31,11 @@ service VantaAuth {
   // Metrics & health
   rpc GetMetrics  (Empty)  returns (MetricsResponse);
   rpc HealthCheck (Empty)  returns (HealthResponse);
+
+  // Backup & restore
+  rpc CreateBackup  (Empty)          returns (BackupResponse);
+  rpc ListBackups   (Empty)          returns (ListBackupsResponse);
+  rpc RestoreBackup (RestoreRequest) returns (StatusResponse);
 }
 
 // ─── Database Service ────────────────────────
@@ -263,6 +268,32 @@ message HealthResponse {
   uint64 database_count      = 3;
   uint64 active_transactions = 4;
   string version             = 5;
+}
+
+// ─── Backup & restore messages ───────────────
+
+message BackupResponse {
+  bool   success        = 1;
+  string path           = 2;
+  uint64 size_bytes     = 3;
+  uint64 database_count = 4;
+  uint64 document_count = 5;
+  string timestamp      = 6;
+  string error          = 7;
+}
+
+message ListBackupsResponse {
+  repeated BackupInfoMsg backups = 1;
+}
+
+message BackupInfoMsg {
+  string path       = 1;
+  uint64 size_bytes = 2;
+  string timestamp  = 3;
+}
+
+message RestoreRequest {
+  string path = 1;
 }
 
 // ─── Database messages ───────────────────────

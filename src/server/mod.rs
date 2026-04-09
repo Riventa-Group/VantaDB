@@ -59,6 +59,8 @@ pub async fn start(
         acl_manager: Arc::clone(&acl_manager),
         audit_logger: Arc::clone(&audit_logger),
         metrics: Arc::clone(&metrics),
+        db_manager: Arc::clone(&db_manager),
+        data_dir: data_dir.to_path_buf(),
         lockout_tracker: Arc::clone(&lockout_tracker),
         global_auth_limiter: Arc::clone(&global_limiter),
         ip_auth_limiter: Arc::clone(&ip_limiter),

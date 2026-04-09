@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,6 +24,8 @@ pub struct VantaAuthServiceImpl {
     pub acl_manager: Arc<AclManager>,
     pub audit_logger: Arc<AuditLogger>,
     pub metrics: Arc<MetricsCollector>,
+    pub db_manager: Arc<DatabaseManager>,
+    pub data_dir: PathBuf,
     pub lockout_tracker: Arc<LockoutTracker>,
     pub global_auth_limiter: Arc<GlobalRateLimiter>,
     pub ip_auth_limiter: Arc<RateLimiter>,
@@ -546,6 +549,99 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
             active_transactions: self.metrics.gauge("active_transactions"),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }))
+    }
+
+    // ---- Backup & restore ---------------------------------------
+
+    async fn create_backup(
+        &self,
+        request: Request<proto::Empty>,
+    ) -> Result<Response<proto::BackupResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let mgr = Arc::clone(&self.db_manager);
+        let data_dir = self.data_dir.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::db::backup::create_backup(&mgr, &data_dir)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        match result {
+            Ok(info) => Ok(Response::new(proto::BackupResponse {
+                success: true,
+                path: info.path,
+                size_bytes: info.size_bytes,
+                database_count: info.database_count as u64,
+                document_count: info.document_count as u64,
+                timestamp: info.timestamp,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::BackupResponse {
+                success: false,
+                path: String::new(),
+                size_bytes: 0,
+                database_count: 0,
+                document_count: 0,
+                timestamp: String::new(),
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn list_backups(
+        &self,
+        request: Request<proto::Empty>,
+    ) -> Result<Response<proto::ListBackupsResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let data_dir = self.data_dir.clone();
+        let backups = tokio::task::spawn_blocking(move || {
+            crate::db::backup::list_backups(&data_dir)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        let msgs: Vec<proto::BackupInfoMsg> = backups
+            .into_iter()
+            .map(|b| proto::BackupInfoMsg {
+                path: b.path,
+                size_bytes: b.size_bytes,
+                timestamp: b.timestamp,
+            })
+            .collect();
+
+        Ok(Response::new(proto::ListBackupsResponse { backups: msgs }))
+    }
+
+    async fn restore_backup(
+        &self,
+        request: Request<proto::RestoreRequest>,
+    ) -> Result<Response<proto::StatusResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let req = request.into_inner();
+        let mgr = Arc::clone(&self.db_manager);
+        let path = req.path;
+
+        tokio::task::spawn_blocking(move || {
+            crate::db::backup::restore_backup(&mgr, &path)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        ok_status()
     }
 }
 
