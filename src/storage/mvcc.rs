@@ -130,6 +130,18 @@ impl MVCCStore {
         &self.engine
     }
 
+    /// Compact all tables in the underlying StorageEngine.
+    /// Writes fresh .vdb snapshots and truncates WALs.
+    pub fn compact_all(&self) -> io::Result<usize> {
+        let tables = self.engine.list_tables();
+        let mut compacted = 0;
+        for table in &tables {
+            self.engine.compact(table)?;
+            compacted += 1;
+        }
+        Ok(compacted)
+    }
+
     // ---- Delegated table operations ----------------------------
 
     pub fn table_exists(&self, table: &str) -> bool {
