@@ -1,4 +1,6 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{AclManager, AuthManager, CertManager, Permission, Role};
@@ -471,6 +473,8 @@ fn require_admin(acl: &AclManager, ctx: &AuthContext, db: &str, col: Option<&str
 
 #[tonic::async_trait]
 impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
+    type WatchCollectionStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::WatchEvent, Status>> + Send>>;
+
     // ---- Database ops ----------------------------------------
 
     async fn create_database(
@@ -1201,6 +1205,81 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                 error: String::new(),
             })),
         }
+    }
+
+    // ---- Change feeds -------------------------------------------
+
+    async fn watch_collection(
+        &self,
+        request: Request<proto::WatchRequest>,
+    ) -> Result<Response<Self::WatchCollectionStream>, Status> {
+        let ctx = extract_auth(&request)?;
+        let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
+
+        let database = req.database;
+        let collection = req.collection;
+        let since = req.since_sequence;
+
+        let feed = Arc::clone(&self.db_manager.change_feed);
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        // Replay buffered events if requested
+        let replay_events = feed.replay(&database, &collection, since);
+        let mut broadcast_rx = feed.subscribe();
+
+        let db_filter = database.clone();
+        let col_filter = collection.clone();
+
+        tokio::spawn(async move {
+            // Send replayed events first
+            for event in replay_events {
+                let watch_event = proto::WatchEvent {
+                    sequence: event.sequence,
+                    operation: event.operation.to_string(),
+                    doc_id: event.doc_id,
+                    document_json: event.document
+                        .map(|d| serde_json::to_string(&d).unwrap_or_default())
+                        .unwrap_or_default(),
+                    timestamp: event.timestamp.to_rfc3339(),
+                };
+                if tx.send(Ok(watch_event)).await.is_err() {
+                    return; // client disconnected
+                }
+            }
+
+            // Stream live events
+            loop {
+                match broadcast_rx.recv().await {
+                    Ok(event) => {
+                        if event.database != db_filter || event.collection != col_filter {
+                            continue;
+                        }
+                        let watch_event = proto::WatchEvent {
+                            sequence: event.sequence,
+                            operation: event.operation.to_string(),
+                            doc_id: event.doc_id,
+                            document_json: event.document
+                                .map(|d| serde_json::to_string(&d).unwrap_or_default())
+                                .unwrap_or_default(),
+                            timestamp: event.timestamp.to_rfc3339(),
+                        };
+                        if tx.send(Ok(watch_event)).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        continue; // skip missed events
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let stream = ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 

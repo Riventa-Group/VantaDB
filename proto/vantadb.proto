@@ -76,6 +76,9 @@ service VantaDb {
   rpc TxUpdate   (TxUpdateRequest)  returns (StatusResponse);
   rpc TxDelete   (TxDeleteRequest)  returns (StatusResponse);
   rpc TxFindById (TxFindByIdRequest) returns (DocumentResponse);
+
+  // Change feeds
+  rpc WatchCollection (WatchRequest) returns (stream WatchEvent);
 }
 
 // ─── Common ──────────────────────────────────
@@ -426,4 +429,20 @@ message TxFindByIdRequest {
   string database   = 2;
   string collection = 3;
   string id         = 4;
+}
+
+// ─── Change feed messages ────────────────────
+
+message WatchRequest {
+  string database       = 1;
+  string collection     = 2;
+  uint64 since_sequence = 3;  // 0 = live only, >0 = replay from this sequence
+}
+
+message WatchEvent {
+  uint64 sequence      = 1;
+  string operation     = 2;  // "insert", "update", "delete"
+  string doc_id        = 3;
+  string document_json = 4;  // empty for deletes
+  string timestamp     = 5;
 }

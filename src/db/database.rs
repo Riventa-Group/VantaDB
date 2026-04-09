@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::storage::{MVCCStore, StorageEngine};
 
+use super::changefeed::{ChangeFeed, ChangeOp};
 use super::aggregation;
 use super::error::VantaError;
 use super::filter::matches_filter;
@@ -103,6 +104,7 @@ pub struct DatabaseManager {
     engines: DashMap<String, Arc<MVCCStore>, RandomState>,
     pub index_manager: IndexManager,
     pub tx_manager: TransactionManager,
+    pub change_feed: Arc<ChangeFeed>,
     db_locks: DashMap<String, Arc<RwLock<()>>, RandomState>,
     global_ddl_lock: RwLock<()>,
 }
@@ -119,6 +121,7 @@ impl DatabaseManager {
             engines: DashMap::with_hasher(RandomState::new()),
             index_manager: IndexManager::new(),
             tx_manager: TransactionManager::new(),
+            change_feed: Arc::new(ChangeFeed::new()),
             db_locks: DashMap::with_hasher(RandomState::new()),
             global_ddl_lock: RwLock::new(()),
         };
@@ -373,6 +376,9 @@ impl DatabaseManager {
         let idx_key = Self::idx_key(db, collection);
         self.index_manager.on_insert(&idx_key, &id, &doc);
 
+        // Emit change event
+        self.change_feed.emit(db, collection, ChangeOp::Insert, &id, Some(doc));
+
         Ok(id)
     }
 
@@ -490,6 +496,7 @@ impl DatabaseManager {
                 let idx_key = Self::idx_key(db, collection);
                 self.index_manager.on_delete(&idx_key, id, doc);
             }
+            self.change_feed.emit(db, collection, ChangeOp::Delete, id, None);
             Ok(true)
         } else {
             Ok(false)
@@ -540,6 +547,9 @@ impl DatabaseManager {
         self.index_manager
             .on_update(&idx_key, id, &old_doc, &new_doc);
 
+        // Emit change event
+        self.change_feed.emit(db, collection, ChangeOp::Update, id, Some(new_doc));
+
         Ok(true)
     }
 
@@ -579,6 +589,7 @@ impl DatabaseManager {
             let data = serde_json::to_vec(&new_doc)?;
             store.put(collection, &id, &data, Uuid::new_v4())?;
             self.index_manager.on_update(&idx_key, &id, doc, &new_doc);
+            self.change_feed.emit(db, collection, ChangeOp::Update, &id, Some(new_doc));
             modified += 1;
         }
 
@@ -1023,17 +1034,15 @@ impl DatabaseManager {
                     let data = serde_json::to_vec(document)?;
                     store.put(collection, id, &data, commit_txn_id)?;
 
-                    // Update indexes
                     let idx_key = Self::idx_key(db, collection);
                     self.index_manager.on_insert(&idx_key, id, document);
+                    self.change_feed.emit(db, collection, ChangeOp::Insert, id, Some(document.clone()));
                 }
                 TransactionOp::Update { db, collection, id, patch: _ } => {
                     let store = self.db_engine(db)?;
-                    // Read the workspace entry for the final state
                     let ws_key = (collection.clone(), id.clone());
                     if let Some(entry) = tx.workspace.get(&ws_key) {
                         if let WorkspaceEntry::Update(ref data) = entry {
-                            // Get old doc for index update
                             let old_doc = store.get_latest(collection, id)
                                 .and_then(|d| serde_json::from_slice::<Value>(&d).ok());
                             store.put(collection, id, data, commit_txn_id)?;
@@ -1042,12 +1051,12 @@ impl DatabaseManager {
                             if let Some(ref old) = old_doc {
                                 self.index_manager.on_update(&idx_key, id, old, &new_doc);
                             }
+                            self.change_feed.emit(db, collection, ChangeOp::Update, id, Some(new_doc));
                         }
                     }
                 }
                 TransactionOp::Delete { db, collection, id } => {
                     let store = self.db_engine(db)?;
-                    // Get old doc for index update
                     let old_doc = store.get_latest(collection, id)
                         .and_then(|d| serde_json::from_slice::<Value>(&d).ok());
                     store.delete(collection, id, commit_txn_id)?;
@@ -1055,6 +1064,7 @@ impl DatabaseManager {
                         let idx_key = Self::idx_key(db, collection);
                         self.index_manager.on_delete(&idx_key, id, doc);
                     }
+                    self.change_feed.emit(db, collection, ChangeOp::Delete, id, None);
                 }
             }
         }
