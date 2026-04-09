@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::storage::StorageEngine;
+use crate::storage::{MVCCStore, StorageEngine};
 
 use super::aggregation;
 use super::error::VantaError;
@@ -100,7 +100,7 @@ struct DbMeta {
 pub struct DatabaseManager {
     base_path: PathBuf,
     meta_engine: StorageEngine,
-    engines: DashMap<String, Arc<StorageEngine>, RandomState>,
+    engines: DashMap<String, Arc<MVCCStore>, RandomState>,
     pub index_manager: IndexManager,
     pub tx_manager: TransactionManager,
     db_locks: DashMap<String, Arc<RwLock<()>>, RandomState>,
@@ -158,28 +158,34 @@ impl DatabaseManager {
     }
 
     /// Load all documents from a collection as (id, Value) pairs.
-    fn load_doc_pairs(engine: &StorageEngine, collection: &str) -> Vec<(String, Value)> {
-        engine
-            .list_keys(collection)
+    fn load_doc_pairs(store: &MVCCStore, collection: &str) -> Vec<(String, Value)> {
+        store
+            .list_keys_latest(collection)
             .into_iter()
             .filter_map(|key| {
-                let data = engine.get(collection, &key)?;
+                let data = store.get_latest(collection, &key)?;
                 let doc: Value = serde_json::from_slice(&data).ok()?;
                 Some((key, doc))
             })
             .collect()
     }
 
-    /// Get or open a cached StorageEngine for a database (#8).
-    /// Engines are cached for the lifetime of the DatabaseManager and only
+    /// Get or open a cached MVCCStore for a database (#8).
+    /// Stores are cached for the lifetime of the DatabaseManager and only
     /// evicted on drop_database.
-    fn db_engine(&self, db_name: &str) -> Result<Arc<StorageEngine>, VantaError> {
-        if let Some(engine) = self.engines.get(db_name) {
-            return Ok(Arc::clone(engine.value()));
+    fn db_engine(&self, db_name: &str) -> Result<Arc<MVCCStore>, VantaError> {
+        if let Some(store) = self.engines.get(db_name) {
+            return Ok(Arc::clone(store.value()));
         }
-        let engine = Arc::new(StorageEngine::open(&self.base_path.join(db_name))?);
-        self.engines.insert(db_name.to_string(), Arc::clone(&engine));
-        Ok(engine)
+        let se = Arc::new(StorageEngine::open(&self.base_path.join(db_name))?);
+        let mvcc = MVCCStore::new(se);
+        // Hydrate MVCC version chains from persisted data
+        for table in mvcc.list_tables() {
+            mvcc.load_from_engine(&table);
+        }
+        let store = Arc::new(mvcc);
+        self.engines.insert(db_name.to_string(), Arc::clone(&store));
+        Ok(store)
     }
 
     /// Acquire a shared (read) lock for DML operations on a database (#10).
@@ -275,14 +281,14 @@ impl DatabaseManager {
         let lock = self.db_read_lock(db);
         let _guard = lock.write(); // exclusive DDL lock on this database (#10)
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        if engine.table_exists(collection) {
+        let store = self.db_engine(db)?;
+        if store.table_exists(collection) {
             return Err(VantaError::AlreadyExists {
                 entity: "Collection",
                 name: format!("{}/{}", db, collection),
             });
         }
-        engine.create_table(collection)?;
+        store.create_table(collection)?;
         self.update_meta_collections(db, |cols| cols.push(collection.to_string()))?;
         Ok(())
     }
@@ -291,14 +297,14 @@ impl DatabaseManager {
         let lock = self.db_read_lock(db);
         let _guard = lock.write(); // exclusive DDL lock on this database (#10)
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        if !engine.table_exists(collection) {
+        let store = self.db_engine(db)?;
+        if !store.table_exists(collection) {
             return Err(VantaError::NotFound {
                 entity: "Collection",
                 name: format!("{}/{}", db, collection),
             });
         }
-        engine.drop_table(collection)?;
+        store.drop_table(collection)?;
         self.update_meta_collections(db, |cols| cols.retain(|c| c != collection))?;
 
         // Clean up indexes and schema
@@ -312,8 +318,8 @@ impl DatabaseManager {
 
     pub fn list_collections(&self, db: &str) -> Result<Vec<String>, VantaError> {
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        Ok(engine
+        let store = self.db_engine(db)?;
+        Ok(store
             .list_tables()
             .into_iter()
             .filter(|t| !t.starts_with('_'))
@@ -331,8 +337,8 @@ impl DatabaseManager {
         let lock = self.db_read_lock(db);
         let _guard = lock.read(); // shared DML lock — DDL blocked while active (#10)
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        if !engine.table_exists(collection) {
+        let store = self.db_engine(db)?;
+        if !store.table_exists(collection) {
             return Err(VantaError::NotFound {
                 entity: "Collection",
                 name: collection.to_string(),
@@ -361,7 +367,7 @@ impl DatabaseManager {
         }
 
         let data = serde_json::to_vec(&doc)?;
-        engine.put(collection, &id, &data)?;
+        store.put(collection, &id, &data, Uuid::new_v4())?;
 
         // Update indexes
         let idx_key = Self::idx_key(db, collection);
@@ -377,8 +383,8 @@ impl DatabaseManager {
         id: &str,
     ) -> Result<Option<Value>, VantaError> {
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        match engine.get(collection, id) {
+        let store = self.db_engine(db)?;
+        match store.get_latest(collection, id) {
             Some(data) => {
                 let doc: Value = serde_json::from_slice(&data)?;
                 Ok(Some(doc))
@@ -389,11 +395,11 @@ impl DatabaseManager {
 
     pub fn find_all(&self, db: &str, collection: &str) -> Result<Vec<Value>, VantaError> {
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        let keys = engine.list_keys(collection);
+        let store = self.db_engine(db)?;
+        let keys = store.list_keys_latest(collection);
         let mut docs = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(data) = engine.get(collection, &key) {
+            if let Some(data) = store.get_latest(collection, &key) {
                 if let Ok(doc) = serde_json::from_slice::<Value>(&data) {
                     docs.push(doc);
                 }
@@ -414,11 +420,11 @@ impl DatabaseManager {
         // Try index lookup first (#17)
         let idx_key = Self::idx_key(db, collection);
         if let Some(idx) = self.index_manager.get_index(&idx_key, field) {
-            let engine = self.db_engine(db)?;
+            let store = self.db_engine(db)?;
             let ids = idx.lookup_eq(value);
             let mut docs = Vec::with_capacity(ids.len());
             for id in &ids {
-                if let Some(data) = engine.get(collection, id) {
+                if let Some(data) = store.get_latest(collection, id) {
                     if let Ok(doc) = serde_json::from_slice::<Value>(&data) {
                         // Double-check in case of stale index entry
                         if doc.get(field) == Some(value) {
@@ -470,29 +476,30 @@ impl DatabaseManager {
         let lock = self.db_read_lock(db);
         let _guard = lock.read();
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
+        let store = self.db_engine(db)?;
 
         // Get old doc for index update
-        let old_doc = engine
-            .get(collection, id)
+        let old_doc = store
+            .get_latest(collection, id)
             .and_then(|data| serde_json::from_slice::<Value>(&data).ok());
 
-        let deleted = engine.delete(collection, id)?;
+        let result = store.delete(collection, id, Uuid::new_v4())?;
 
-        if deleted {
+        if result.is_some() {
             if let Some(ref doc) = old_doc {
                 let idx_key = Self::idx_key(db, collection);
                 self.index_manager.on_delete(&idx_key, id, doc);
             }
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(deleted)
     }
 
     pub fn count(&self, db: &str, collection: &str) -> Result<usize, VantaError> {
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
-        Ok(engine.count(collection))
+        let store = self.db_engine(db)?;
+        Ok(store.count_latest(collection))
     }
 
     // ---- Update operations -----------------------------------
@@ -507,9 +514,9 @@ impl DatabaseManager {
         let lock = self.db_read_lock(db);
         let _guard = lock.read();
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
+        let store = self.db_engine(db)?;
 
-        let old_data = match engine.get(collection, id) {
+        let old_data = match store.get_latest(collection, id) {
             Some(d) => d,
             None => return Ok(false),
         };
@@ -526,7 +533,7 @@ impl DatabaseManager {
         }
 
         let data = serde_json::to_vec(&new_doc)?;
-        engine.put(collection, id, &data)?;
+        store.put(collection, id, &data, Uuid::new_v4())?;
 
         // Update indexes
         let idx_key = Self::idx_key(db, collection);
@@ -544,7 +551,7 @@ impl DatabaseManager {
         patch: &Value,
     ) -> Result<u64, VantaError> {
         let docs = self.find_all(db, collection)?;
-        let engine = self.db_engine(db)?;
+        let store = self.db_engine(db)?;
         let schema = self.get_schema_internal(db, collection);
         let idx_key = Self::idx_key(db, collection);
         let mut modified = 0u64;
@@ -570,7 +577,7 @@ impl DatabaseManager {
             }
 
             let data = serde_json::to_vec(&new_doc)?;
-            engine.put(collection, &id, &data)?;
+            store.put(collection, &id, &data, Uuid::new_v4())?;
             self.index_manager.on_update(&idx_key, &id, doc, &new_doc);
             modified += 1;
         }
@@ -588,7 +595,7 @@ impl DatabaseManager {
         opts: &QueryOptions,
     ) -> Result<(Vec<Value>, usize), VantaError> {
         self.require_db(db)?;
-        let engine = self.db_engine(db)?;
+        let store = self.db_engine(db)?;
 
         let idx_key = Self::idx_key(db, collection);
         let indexes = self.index_manager.get_all_indexes(&idx_key);
@@ -612,7 +619,7 @@ impl DatabaseManager {
                 let mut docs = Vec::with_capacity(candidate_ids.len());
 
                 for id in &candidate_ids {
-                    if let Some(data) = engine.get(collection, id) {
+                    if let Some(data) = store.get_latest(collection, id) {
                         if let Ok(doc) = serde_json::from_slice::<Value>(&data) {
                             // Apply residual filter if any
                             let passes = match &residual_filter {
@@ -701,8 +708,8 @@ impl DatabaseManager {
         }
 
         // Load all docs to build the index
-        let engine = self.db_engine(db)?;
-        let doc_pairs = Self::load_doc_pairs(&engine, collection);
+        let store = self.db_engine(db)?;
+        let doc_pairs = Self::load_doc_pairs(&store, collection);
 
         let def = IndexDef {
             collection: key.clone(),
