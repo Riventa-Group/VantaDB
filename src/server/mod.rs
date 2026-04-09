@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod auth_interceptor;
 pub mod lockout;
 pub mod rate_limit;
@@ -12,6 +13,7 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 use crate::auth::{AclManager, AuthManager, CertManager};
 use crate::db::DatabaseManager;
 use crate::storage::StorageEngine;
+use audit::AuditLogger;
 use auth_interceptor::AuthInterceptor;
 use lockout::LockoutTracker;
 use rate_limit::{GlobalRateLimiter, RateLimiter};
@@ -42,6 +44,7 @@ pub async fn start(
     let db_manager = Arc::new(db_manager);
     let cert_manager = Arc::new(cert_manager);
     let acl_manager = Arc::new(acl_manager);
+    let audit_logger = Arc::new(AuditLogger::new(Arc::clone(&engine))?);
     let lockout_tracker = Arc::new(LockoutTracker::new());
     let global_limiter = Arc::new(GlobalRateLimiter::new(10.0, 10.0));
     let ip_limiter = Arc::new(RateLimiter::new(3.0, 3.0));
@@ -51,6 +54,7 @@ pub async fn start(
         jwt_manager: Arc::clone(&jwt_manager),
         cert_manager: Arc::clone(&cert_manager),
         acl_manager: Arc::clone(&acl_manager),
+        audit_logger: Arc::clone(&audit_logger),
         lockout_tracker: Arc::clone(&lockout_tracker),
         global_auth_limiter: Arc::clone(&global_limiter),
         ip_auth_limiter: Arc::clone(&ip_limiter),
@@ -59,6 +63,7 @@ pub async fn start(
     let db_service = VantaDbServiceImpl {
         db_manager: Arc::clone(&db_manager),
         acl_manager: Arc::clone(&acl_manager),
+        audit_logger: Arc::clone(&audit_logger),
     };
 
     let interceptor = AuthInterceptor {

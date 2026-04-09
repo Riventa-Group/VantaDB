@@ -7,6 +7,7 @@ use crate::auth::{AclManager, AuthManager, CertManager, Permission, Role};
 use crate::db::{CollectionSchema, DatabaseManager, QueryOptions, VantaError};
 use super::auth_interceptor::{extract_auth, extract_auth_from_metadata, AuthContext};
 use super::proto;
+use super::audit::AuditLogger;
 use super::lockout::LockoutTracker;
 use super::rate_limit::{GlobalRateLimiter, RateLimiter};
 use super::session::JwtSessionManager;
@@ -18,6 +19,7 @@ pub struct VantaAuthServiceImpl {
     pub jwt_manager: Arc<JwtSessionManager>,
     pub cert_manager: Arc<CertManager>,
     pub acl_manager: Arc<AclManager>,
+    pub audit_logger: Arc<AuditLogger>,
     pub lockout_tracker: Arc<LockoutTracker>,
     pub global_auth_limiter: Arc<GlobalRateLimiter>,
     pub ip_auth_limiter: Arc<RateLimiter>,
@@ -71,6 +73,10 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         match result {
             Ok(Some(user)) => {
                 self.lockout_tracker.clear(&username);
+                self.audit_logger.record(
+                    &username, &user.role.to_string(), "authenticate",
+                    None, None, "{}", true, None,
+                );
                 let token = self
                     .jwt_manager
                     .create_token(&user.username, &user.role);
@@ -83,6 +89,10 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
             }
             Ok(None) => {
                 self.lockout_tracker.record_failure(&username);
+                self.audit_logger.record(
+                    &username, "", "authenticate",
+                    None, None, "{}", false, Some("Invalid credentials"),
+                );
                 Ok(Response::new(proto::AuthResponse {
                     success: false,
                     token: String::new(),
@@ -430,6 +440,59 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
 
         ok_status()
     }
+
+    // ---- Audit log ----------------------------------------------
+
+    async fn query_audit_log(
+        &self,
+        request: Request<proto::AuditLogRequest>,
+    ) -> Result<Response<proto::AuditLogResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        let req = request.into_inner();
+        let logger = Arc::clone(&self.audit_logger);
+
+        let since = if req.since.is_empty() {
+            None
+        } else {
+            Some(chrono::DateTime::parse_from_rfc3339(&req.since)
+                .map_err(|e| Status::invalid_argument(format!("Invalid since timestamp: {}", e)))?
+                .with_timezone(&chrono::Utc))
+        };
+
+        let filter = super::audit::AuditFilter {
+            username: if req.username.is_empty() { None } else { Some(req.username) },
+            operation: if req.operation.is_empty() { None } else { Some(req.operation) },
+            database: if req.database.is_empty() { None } else { Some(req.database) },
+            since,
+            limit: req.limit as usize,
+        };
+
+        let events = tokio::task::spawn_blocking(move || logger.query(&filter))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let entries: Vec<proto::AuditEntry> = events
+            .into_iter()
+            .map(|e| proto::AuditEntry {
+                id: e.id,
+                timestamp: e.timestamp.to_rfc3339(),
+                username: e.username,
+                role: e.role,
+                operation: e.operation,
+                database: e.database.unwrap_or_default(),
+                collection: e.collection.unwrap_or_default(),
+                detail: e.detail,
+                success: e.success,
+                error: e.error.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(proto::AuditLogResponse { entries }))
+    }
 }
 
 // ---- VantaDb Service -----------------------------------------
@@ -437,6 +500,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
 pub struct VantaDbServiceImpl {
     pub db_manager: Arc<DatabaseManager>,
     pub acl_manager: Arc<AclManager>,
+    pub audit_logger: Arc<AuditLogger>,
 }
 
 /// Helper to convert VantaError to gRPC Status
@@ -486,13 +550,14 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         require_admin(&self.acl_manager, &ctx, &req.database, None)?;
 
         let mgr = Arc::clone(&self.db_manager);
-        let db = req.database;
+        let db = req.database.clone();
 
         tokio::task::spawn_blocking(move || mgr.create_database(&db))
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "create_database", Some(&req.database), None, "{}", true, None);
         ok_status()
     }
 
@@ -505,13 +570,14 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         require_admin(&self.acl_manager, &ctx, &req.database, None)?;
 
         let mgr = Arc::clone(&self.db_manager);
-        let db = req.database;
+        let db = req.database.clone();
 
         tokio::task::spawn_blocking(move || mgr.drop_database(&db))
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "drop_database", Some(&req.database), None, "{}", true, None);
         ok_status()
     }
 
@@ -608,12 +674,21 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         }
 
         let mgr = Arc::clone(&self.db_manager);
-        let db = req.database;
-        let col = req.collection;
+        let db = req.database.clone();
+        let col = req.collection.clone();
 
         let result = tokio::task::spawn_blocking(move || mgr.insert(&db, &col, doc))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        match result {
+            Ok(ref id) => {
+                self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), &format!("{{\"_id\":\"{}\"}}", id), true, None);
+            }
+            Err(ref e) => {
+                self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), "{}", false, Some(&e.to_string()));
+            }
+        }
 
         match result {
             Ok(id) => Ok(Response::new(proto::InsertResponse {

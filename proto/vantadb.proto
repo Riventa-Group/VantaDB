@@ -24,6 +24,9 @@ service VantaAuth {
   rpc SetAcl       (SetAclRequest)     returns (StatusResponse);
   rpc GetAcl       (GetAclRequest)     returns (GetAclResponse);
   rpc DeleteAcl    (DeleteAclRequest)  returns (StatusResponse);
+
+  // Audit log
+  rpc QueryAuditLog (AuditLogRequest)  returns (AuditLogResponse);
 }
 
 // ─── Database Service ────────────────────────
@@ -201,6 +204,33 @@ message CollectionAclMsg {
 
 message DeleteAclRequest {
   string username = 1;
+}
+
+// ─── Audit log messages ──────────────────────
+
+message AuditLogRequest {
+  string username  = 1;  // filter by username (empty = all)
+  string operation = 2;  // filter by operation (empty = all)
+  string database  = 3;  // filter by database (empty = all)
+  string since     = 4;  // ISO 8601 timestamp (empty = all time)
+  uint32 limit     = 5;  // max results (0 = default 100)
+}
+
+message AuditLogResponse {
+  repeated AuditEntry entries = 1;
+}
+
+message AuditEntry {
+  string id         = 1;
+  string timestamp  = 2;
+  string username   = 3;
+  string role       = 4;
+  string operation  = 5;
+  string database   = 6;
+  string collection = 7;
+  string detail     = 8;
+  bool   success    = 9;
+  string error      = 10;
 }
 
 // ─── Database messages ───────────────────────
