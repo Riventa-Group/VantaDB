@@ -35,6 +35,9 @@ prost = "0.13"
 regex = "1"
 crc32c = "0.6"
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 tonic-build = "0.12"
 
