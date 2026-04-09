@@ -3,12 +3,14 @@ use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
 };
 use chrono::{DateTime, Utc};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::storage::StorageEngine;
 
 const AUTH_TABLE: &str = "_vanta_users";
+const MIN_PASSWORD_LENGTH: usize = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Role {
@@ -78,14 +80,55 @@ impl AuthManager {
             self.engine.create_table(AUTH_TABLE)?;
         }
         if self.get_user("root")?.is_none() {
+            let password = generate_random_password(32);
+
+            let salt = SaltString::generate(&mut OsRng);
+            let password_hash = Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .to_string();
+
             let root = User {
                 username: "root".to_string(),
-                password_hash: None, // root has no password
+                password_hash: Some(password_hash),
                 role: Role::Root,
                 created_at: Utc::now(),
                 databases: vec![],
             };
             self.save_user(&root)?;
+
+            eprintln!();
+            eprintln!("  ╔══════════════════════════════════════════════════╗");
+            eprintln!("  ║  ROOT PASSWORD (save this — shown only once!)   ║");
+            eprintln!("  ║                                                  ║");
+            eprintln!("  ║  {}  ║", password);
+            eprintln!("  ║                                                  ║");
+            eprintln!("  ╚══════════════════════════════════════════════════╝");
+            eprintln!();
+        } else if let Some(user) = self.get_user("root")? {
+            // Migrate legacy passwordless root: force a new password
+            if user.password_hash.is_none() {
+                let password = generate_random_password(32);
+
+                let salt = SaltString::generate(&mut OsRng);
+                let password_hash = Argon2::default()
+                    .hash_password(password.as_bytes(), &salt)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .to_string();
+
+                let mut root = user;
+                root.password_hash = Some(password_hash);
+                self.save_user(&root)?;
+
+                eprintln!();
+                eprintln!("  ╔══════════════════════════════════════════════════╗");
+                eprintln!("  ║  ROOT PASSWORD MIGRATED (save this!)            ║");
+                eprintln!("  ║                                                  ║");
+                eprintln!("  ║  {}  ║", password);
+                eprintln!("  ║                                                  ║");
+                eprintln!("  ╚══════════════════════════════════════════════════╝");
+                eprintln!();
+            }
         }
         Ok(())
     }
@@ -113,11 +156,6 @@ impl AuthManager {
             None => return Ok(None),
         };
 
-        // Root user needs no password
-        if user.role == Role::Root && user.password_hash.is_none() {
-            return Ok(Some(user));
-        }
-
         match &user.password_hash {
             Some(hash) => {
                 let parsed = PasswordHash::new(hash)
@@ -128,10 +166,7 @@ impl AuthManager {
                     Ok(None)
                 }
             }
-            None => {
-                // No password set and not root = deny
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 
@@ -148,6 +183,13 @@ impl AuthManager {
 
         if role == Role::Root {
             return Ok(Err("Cannot create another root user".to_string()));
+        }
+
+        if password.len() < MIN_PASSWORD_LENGTH {
+            return Ok(Err(format!(
+                "Password must be at least {} characters",
+                MIN_PASSWORD_LENGTH
+            )));
         }
 
         let salt = SaltString::generate(&mut OsRng);
@@ -189,6 +231,13 @@ impl AuthManager {
             None => return Ok(Err(format!("User '{}' not found", username))),
         };
 
+        if password.len() < MIN_PASSWORD_LENGTH {
+            return Ok(Err(format!(
+                "Password must be at least {} characters",
+                MIN_PASSWORD_LENGTH
+            )));
+        }
+
         let salt = SaltString::generate(&mut OsRng);
         let password_hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
@@ -199,4 +248,12 @@ impl AuthManager {
         self.save_user(&user)?;
         Ok(Ok(()))
     }
+}
+
+fn generate_random_password(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*";
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
 }
