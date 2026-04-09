@@ -152,8 +152,34 @@ pub async fn start(
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
+    // ---- Graceful shutdown sequence ----
+    println!();
     println!(
-        "\n  {} {}",
+        "  {} {}",
+        "→".truecolor(120, 80, 255),
+        "Shutting down...".dimmed()
+    );
+
+    // Stop background scheduler
+    _scheduler.stop();
+
+    // Reap transactions, compact WALs, run final GC
+    let (reaped, compacted, pruned) = tokio::task::spawn_blocking({
+        let mgr = Arc::clone(&db_manager);
+        move || mgr.shutdown()
+    })
+    .await
+    .unwrap_or((0, 0, 0));
+
+    println!(
+        "  {} Flushed {} tables, reaped {} transactions, pruned {} versions",
+        "✓".green().bold(),
+        compacted,
+        reaped,
+        pruned
+    );
+    println!(
+        "  {} {}",
         "←".truecolor(120, 80, 255),
         "Server stopped.".dimmed()
     );
@@ -161,7 +187,23 @@ pub async fn start(
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl+c");
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .expect("Failed to listen for SIGTERM");
+
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("Failed to listen for ctrl+c");
+    }
 }
