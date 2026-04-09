@@ -1,6 +1,10 @@
+use ahash::RandomState;
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::storage::StorageEngine;
@@ -95,8 +99,11 @@ struct DbMeta {
 pub struct DatabaseManager {
     base_path: PathBuf,
     meta_engine: StorageEngine,
+    engines: DashMap<String, Arc<StorageEngine>, RandomState>,
     pub index_manager: IndexManager,
     pub tx_manager: TransactionManager,
+    db_locks: DashMap<String, Arc<RwLock<()>>, RandomState>,
+    global_ddl_lock: RwLock<()>,
 }
 
 impl DatabaseManager {
@@ -108,13 +115,33 @@ impl DatabaseManager {
         Ok(Self {
             base_path: base_path.to_path_buf(),
             meta_engine,
+            engines: DashMap::with_hasher(RandomState::new()),
             index_manager: IndexManager::new(),
             tx_manager: TransactionManager::new(),
+            db_locks: DashMap::with_hasher(RandomState::new()),
+            global_ddl_lock: RwLock::new(()),
         })
     }
 
-    fn db_engine(&self, db_name: &str) -> Result<StorageEngine, VantaError> {
-        Ok(StorageEngine::open(&self.base_path.join(db_name))?)
+    /// Get or open a cached StorageEngine for a database (#8).
+    /// Engines are cached for the lifetime of the DatabaseManager and only
+    /// evicted on drop_database.
+    fn db_engine(&self, db_name: &str) -> Result<Arc<StorageEngine>, VantaError> {
+        if let Some(engine) = self.engines.get(db_name) {
+            return Ok(Arc::clone(engine.value()));
+        }
+        let engine = Arc::new(StorageEngine::open(&self.base_path.join(db_name))?);
+        self.engines.insert(db_name.to_string(), Arc::clone(&engine));
+        Ok(engine)
+    }
+
+    /// Acquire a shared (read) lock for DML operations on a database (#10).
+    fn db_read_lock(&self, db: &str) -> Arc<RwLock<()>> {
+        self.db_locks
+            .entry(db.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .value()
+            .clone()
     }
 
     fn idx_key(db: &str, collection: &str) -> String {
@@ -143,6 +170,7 @@ impl DatabaseManager {
     // ---- Database ops ----------------------------------------
 
     pub fn create_database(&self, name: &str) -> Result<(), VantaError> {
+        let _guard = self.global_ddl_lock.write();
         if self.meta_engine.get(META_TABLE, name).is_some() {
             return Err(VantaError::AlreadyExists {
                 entity: "Database",
@@ -160,6 +188,7 @@ impl DatabaseManager {
     }
 
     pub fn drop_database(&self, name: &str) -> Result<(), VantaError> {
+        let _guard = self.global_ddl_lock.write();
         self.require_db(name)?;
         // Clean up indexes and schemas for all collections
         if let Ok(cols) = self.list_collections(name) {
@@ -171,6 +200,9 @@ impl DatabaseManager {
             }
         }
         self.meta_engine.delete(META_TABLE, name)?;
+        // Evict cached engine
+        self.engines.remove(name);
+        self.db_locks.remove(name);
         let db_path = self.base_path.join(name);
         if db_path.exists() {
             std::fs::remove_dir_all(db_path)?;
@@ -193,6 +225,8 @@ impl DatabaseManager {
     // ---- Collection ops --------------------------------------
 
     pub fn create_collection(&self, db: &str, collection: &str) -> Result<(), VantaError> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.write(); // exclusive DDL lock on this database (#10)
         self.require_db(db)?;
         let engine = self.db_engine(db)?;
         if engine.table_exists(collection) {
@@ -207,6 +241,8 @@ impl DatabaseManager {
     }
 
     pub fn drop_collection(&self, db: &str, collection: &str) -> Result<(), VantaError> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.write(); // exclusive DDL lock on this database (#10)
         self.require_db(db)?;
         let engine = self.db_engine(db)?;
         if !engine.table_exists(collection) {
@@ -245,6 +281,8 @@ impl DatabaseManager {
         collection: &str,
         document: Value,
     ) -> Result<String, VantaError> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.read(); // shared DML lock — DDL blocked while active (#10)
         self.require_db(db)?;
         let engine = self.db_engine(db)?;
         if !engine.table_exists(collection) {
@@ -360,6 +398,8 @@ impl DatabaseManager {
         collection: &str,
         id: &str,
     ) -> Result<bool, VantaError> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.read();
         self.require_db(db)?;
         let engine = self.db_engine(db)?;
 
@@ -395,6 +435,8 @@ impl DatabaseManager {
         id: &str,
         patch: Value,
     ) -> Result<bool, VantaError> {
+        let lock = self.db_read_lock(db);
+        let _guard = lock.read();
         self.require_db(db)?;
         let engine = self.db_engine(db)?;
 
