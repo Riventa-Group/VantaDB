@@ -446,6 +446,26 @@ impl DatabaseManager {
     pub fn all_stores(&self) -> Vec<Arc<MVCCStore>> {
         self.engines.iter().map(|e| Arc::clone(e.value())).collect()
     }
+
+    /// Graceful shutdown: reap transactions, compact WALs, run GC.
+    /// Returns (reaped_tx, compacted_tables, pruned_versions).
+    pub fn shutdown(&self) -> (usize, usize, usize) {
+        let reaped = self.tx_manager.reap_expired();
+
+        let stores = self.all_stores();
+        let mut compacted = 0;
+        let mut pruned = 0;
+
+        for store in &stores {
+            pruned += store.gc();
+            match store.compact_all() {
+                Ok(n) => compacted += n,
+                Err(e) => eprintln!("  shutdown: compaction error: {}", e),
+            }
+        }
+
+        (reaped, compacted, pruned)
+    }
 }
 
 // ---- Update patch application ----------------------------
