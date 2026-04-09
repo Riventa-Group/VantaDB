@@ -9,7 +9,7 @@ use std::path::Path;
 use colored::*;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-use crate::auth::{AuthManager, CertManager};
+use crate::auth::{AclManager, AuthManager, CertManager};
 use crate::db::DatabaseManager;
 use crate::storage::StorageEngine;
 use auth_interceptor::AuthInterceptor;
@@ -32,13 +32,16 @@ pub async fn start(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
-    // Bootstrap certificates (needed for cert management RPCs even without TLS)
-    let cert_manager = CertManager::bootstrap(data_dir, Arc::new(engine))?;
+    // Bootstrap certificates and ACLs
+    let engine = Arc::new(engine);
+    let cert_manager = CertManager::bootstrap(data_dir, Arc::clone(&engine))?;
+    let acl_manager = AclManager::new(Arc::clone(&engine))?;
 
     let jwt_manager = Arc::new(JwtSessionManager::new(24));
     let auth_manager = Arc::new(auth);
     let db_manager = Arc::new(db_manager);
     let cert_manager = Arc::new(cert_manager);
+    let acl_manager = Arc::new(acl_manager);
     let lockout_tracker = Arc::new(LockoutTracker::new());
     let global_limiter = Arc::new(GlobalRateLimiter::new(10.0, 10.0));
     let ip_limiter = Arc::new(RateLimiter::new(3.0, 3.0));
@@ -47,6 +50,7 @@ pub async fn start(
         auth_manager: Arc::clone(&auth_manager),
         jwt_manager: Arc::clone(&jwt_manager),
         cert_manager: Arc::clone(&cert_manager),
+        acl_manager: Arc::clone(&acl_manager),
         lockout_tracker: Arc::clone(&lockout_tracker),
         global_auth_limiter: Arc::clone(&global_limiter),
         ip_auth_limiter: Arc::clone(&ip_limiter),
@@ -54,6 +58,7 @@ pub async fn start(
 
     let db_service = VantaDbServiceImpl {
         db_manager: Arc::clone(&db_manager),
+        acl_manager: Arc::clone(&acl_manager),
     };
 
     let interceptor = AuthInterceptor {
