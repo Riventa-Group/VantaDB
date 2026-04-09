@@ -1,4 +1,5 @@
 pub mod aggregation;
+pub mod backup;
 pub mod changefeed;
 pub mod database;
 pub mod error;
