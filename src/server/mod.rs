@@ -1,4 +1,6 @@
 pub mod auth_interceptor;
+pub mod lockout;
+pub mod rate_limit;
 pub mod service;
 pub mod session;
 
@@ -11,6 +13,8 @@ use crate::auth::{AuthManager, CertManager};
 use crate::db::DatabaseManager;
 use crate::storage::StorageEngine;
 use auth_interceptor::AuthInterceptor;
+use lockout::LockoutTracker;
+use rate_limit::{GlobalRateLimiter, RateLimiter};
 use service::{VantaAuthServiceImpl, VantaDbServiceImpl};
 use session::JwtSessionManager;
 
@@ -35,11 +39,17 @@ pub async fn start(
     let auth_manager = Arc::new(auth);
     let db_manager = Arc::new(db_manager);
     let cert_manager = Arc::new(cert_manager);
+    let lockout_tracker = Arc::new(LockoutTracker::new());
+    let global_limiter = Arc::new(GlobalRateLimiter::new(10.0, 10.0));
+    let ip_limiter = Arc::new(RateLimiter::new(3.0, 3.0));
 
     let auth_service = VantaAuthServiceImpl {
         auth_manager: Arc::clone(&auth_manager),
         jwt_manager: Arc::clone(&jwt_manager),
         cert_manager: Arc::clone(&cert_manager),
+        lockout_tracker: Arc::clone(&lockout_tracker),
+        global_auth_limiter: Arc::clone(&global_limiter),
+        ip_auth_limiter: Arc::clone(&ip_limiter),
     };
 
     let db_service = VantaDbServiceImpl {
