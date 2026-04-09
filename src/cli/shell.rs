@@ -39,7 +39,8 @@ impl Shell {
         let data_dir = Self::data_dir();
         let engine = StorageEngine::open(&data_dir.join("system"))?;
         let auth = AuthManager::new(engine)?;
-        let db_manager = DatabaseManager::new(&data_dir.join("data"))?;
+        let db_manager = DatabaseManager::new(&data_dir.join("data"))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok((StorageEngine::open(&data_dir.join("system"))?, auth, db_manager))
     }
 
@@ -66,7 +67,7 @@ impl Shell {
         println!();
         println!(
             "  {}  {}",
-            "v0.1.0".dimmed(),
+            format!("v{}", env!("CARGO_PKG_VERSION")).dimmed(),
             "| Next-Gen Database Engine".dimmed()
         );
         println!(

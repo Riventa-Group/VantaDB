@@ -19,7 +19,7 @@ use cli::Shell;
 #[command(
     name = "vantadb",
     about = "VantaDB — Next-Gen Database Engine",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     author = "Riventa Group"
 )]
 struct Cli {
@@ -142,7 +142,7 @@ fn run_status() {
     println!(
         "  {} {}",
         "Version:".dimmed(),
-        "0.1.0".truecolor(120, 200, 120)
+        env!("CARGO_PKG_VERSION").truecolor(120, 200, 120)
     );
     println!(
         "  {} {}",

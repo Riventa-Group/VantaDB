@@ -2,12 +2,12 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{AuthManager, Role};
-use crate::db::{CollectionSchema, DatabaseManager, QueryOptions};
+use crate::db::{CollectionSchema, DatabaseManager, QueryOptions, VantaError};
 use super::auth_interceptor::{extract_auth, extract_auth_from_metadata};
 use super::proto;
 use super::session::SessionStore;
 
-// ─── VantaAuth Service ───────────────────────────────────
+// ---- VantaAuth Service ---------------------------------------
 
 pub struct VantaAuthServiceImpl {
     pub auth_manager: Arc<AuthManager>,
@@ -190,15 +190,20 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
     }
 }
 
-// ─── VantaDb Service ─────────────────────────────────────
+// ---- VantaDb Service -----------------------------------------
 
 pub struct VantaDbServiceImpl {
     pub db_manager: Arc<DatabaseManager>,
 }
 
+/// Helper to convert VantaError to gRPC Status
+fn vanta_err(e: VantaError) -> Status {
+    e.to_grpc_status()
+}
+
 #[tonic::async_trait]
 impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
-    // ── Database ops ──────────────────────────
+    // ---- Database ops ----------------------------------------
 
     async fn create_database(
         &self,
@@ -213,15 +218,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
 
-        let result = tokio::task::spawn_blocking(move || mgr.create_database(&db))
+        tokio::task::spawn_blocking(move || mgr.create_database(&db))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn drop_database(
@@ -237,15 +239,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
 
-        let result = tokio::task::spawn_blocking(move || mgr.drop_database(&db))
+        tokio::task::spawn_blocking(move || mgr.drop_database(&db))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn list_databases(
@@ -263,7 +262,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         Ok(Response::new(proto::ListDatabasesResponse { databases }))
     }
 
-    // ── Collection ops ────────────────────────
+    // ---- Collection ops --------------------------------------
 
     async fn create_collection(
         &self,
@@ -279,15 +278,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result = tokio::task::spawn_blocking(move || mgr.create_collection(&db, &col))
+        tokio::task::spawn_blocking(move || mgr.create_collection(&db, &col))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn drop_collection(
@@ -304,15 +300,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result = tokio::task::spawn_blocking(move || mgr.drop_collection(&db, &col))
+        tokio::task::spawn_blocking(move || mgr.drop_collection(&db, &col))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn list_collections(
@@ -325,20 +318,15 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
 
-        let result = tokio::task::spawn_blocking(move || mgr.list_collections(&db))
+        let collections = tokio::task::spawn_blocking(move || mgr.list_collections(&db))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(collections)) => {
-                Ok(Response::new(proto::ListCollectionsResponse { collections }))
-            }
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        Ok(Response::new(proto::ListCollectionsResponse { collections }))
     }
 
-    // ── Document CRUD ─────────────────────────
+    // ---- Document CRUD ---------------------------------------
 
     async fn insert(
         &self,
@@ -366,17 +354,16 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(Ok(id)) => Ok(Response::new(proto::InsertResponse {
+            Ok(id) => Ok(Response::new(proto::InsertResponse {
                 success: true,
                 id,
                 error: String::new(),
             })),
-            Ok(Err(e)) => Ok(Response::new(proto::InsertResponse {
+            Err(e) => Ok(Response::new(proto::InsertResponse {
                 success: false,
                 id: String::new(),
-                error: e,
+                error: e.to_string(),
             })),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
@@ -394,10 +381,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
 
         let result = tokio::task::spawn_blocking(move || mgr.find_by_id(&db, &col, &id))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
         match result {
-            Ok(Ok(Some(doc))) => {
+            Some(doc) => {
                 let json = serde_json::to_string(&doc)
                     .map_err(|e| Status::internal(e.to_string()))?;
                 Ok(Response::new(proto::DocumentResponse {
@@ -406,13 +394,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                     error: String::new(),
                 }))
             }
-            Ok(Ok(None)) => Ok(Response::new(proto::DocumentResponse {
+            None => Ok(Response::new(proto::DocumentResponse {
                 found: false,
                 document_json: String::new(),
                 error: String::new(),
             })),
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
@@ -428,15 +414,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result = tokio::task::spawn_blocking(move || mgr.find_all_query(&db, &col, &opts))
+        let (docs, total) = tokio::task::spawn_blocking(move || mgr.find_all_query(&db, &col, &opts))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok((docs, total))) => docs_response(docs, total),
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        docs_response(docs, total)
     }
 
     async fn find_where(
@@ -455,18 +438,15 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let col = req.collection;
         let field = req.field;
 
-        let result =
+        let (docs, total) =
             tokio::task::spawn_blocking(move || {
                 mgr.find_where_query(&db, &col, &field, &value, &opts)
             })
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok((docs, total))) => docs_response(docs, total),
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        docs_response(docs, total)
     }
 
     async fn delete_by_id(
@@ -489,17 +469,16 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(Ok(found)) => Ok(Response::new(proto::DeleteResponse {
+            Ok(found) => Ok(Response::new(proto::DeleteResponse {
                 success: true,
                 found,
                 error: String::new(),
             })),
-            Ok(Err(e)) => Ok(Response::new(proto::DeleteResponse {
+            Err(e) => Ok(Response::new(proto::DeleteResponse {
                 success: false,
                 found: false,
-                error: e,
+                error: e.to_string(),
             })),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
@@ -514,21 +493,18 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result = tokio::task::spawn_blocking(move || mgr.count(&db, &col))
+        let count = tokio::task::spawn_blocking(move || mgr.count(&db, &col))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(count)) => Ok(Response::new(proto::CountResponse {
-                count: count as u64,
-                error: String::new(),
-            })),
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        Ok(Response::new(proto::CountResponse {
+            count: count as u64,
+            error: String::new(),
+        }))
     }
 
-    // ── Update ops ────────────────────────────
+    // ---- Update ops ------------------------------------------
 
     async fn update(
         &self,
@@ -554,17 +530,16 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                 .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(Ok(found)) => Ok(Response::new(proto::UpdateResponse {
+            Ok(found) => Ok(Response::new(proto::UpdateResponse {
                 success: true,
                 modified_count: if found { 1 } else { 0 },
                 error: String::new(),
             })),
-            Ok(Err(e)) => Ok(Response::new(proto::UpdateResponse {
+            Err(e) => Ok(Response::new(proto::UpdateResponse {
                 success: false,
                 modified_count: 0,
-                error: e,
+                error: e.to_string(),
             })),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
@@ -593,21 +568,20 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                 .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(Ok(count)) => Ok(Response::new(proto::UpdateResponse {
+            Ok(count) => Ok(Response::new(proto::UpdateResponse {
                 success: true,
                 modified_count: count,
                 error: String::new(),
             })),
-            Ok(Err(e)) => Ok(Response::new(proto::UpdateResponse {
+            Err(e) => Ok(Response::new(proto::UpdateResponse {
                 success: false,
                 modified_count: 0,
-                error: e,
+                error: e.to_string(),
             })),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
-    // ── Rich query ────────────────────────────
+    // ---- Rich query ------------------------------------------
 
     async fn query(
         &self,
@@ -624,19 +598,16 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result =
+        let (docs, total) =
             tokio::task::spawn_blocking(move || mgr.query(&db, &col, &filter, &opts))
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok((docs, total))) => docs_response(docs, total),
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        docs_response(docs, total)
     }
 
-    // ── Aggregation ───────────────────────────
+    // ---- Aggregation -----------------------------------------
 
     async fn aggregate(
         &self,
@@ -658,7 +629,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                 .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(Ok(results)) => {
+            Ok(results) => {
                 let results_json: Result<Vec<String>, _> =
                     results.iter().map(serde_json::to_string).collect();
                 let results_json =
@@ -668,15 +639,14 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                     error: String::new(),
                 }))
             }
-            Ok(Err(e)) => Ok(Response::new(proto::AggregateResponse {
+            Err(e) => Ok(Response::new(proto::AggregateResponse {
                 results_json: vec![],
-                error: e,
+                error: e.to_string(),
             })),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
-    // ── Index ops ─────────────────────────────
+    // ---- Index ops -------------------------------------------
 
     async fn create_index(
         &self,
@@ -694,16 +664,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let field = req.field;
         let unique = req.unique;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.create_index(&db, &col, &field, unique))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.create_index(&db, &col, &field, unique))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn drop_index(
@@ -721,16 +687,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let col = req.collection;
         let field = req.field;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.drop_index(&db, &col, &field))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.drop_index(&db, &col, &field))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn list_indexes(
@@ -744,28 +706,22 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.list_indexes(&db, &col))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let indexes = tokio::task::spawn_blocking(move || mgr.list_indexes(&db, &col))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(indexes)) => {
-                let infos: Vec<proto::IndexInfo> = indexes
-                    .iter()
-                    .map(|idx| proto::IndexInfo {
-                        field: idx.field.clone(),
-                        unique: idx.unique,
-                    })
-                    .collect();
-                Ok(Response::new(proto::ListIndexesResponse { indexes: infos }))
-            }
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        let infos: Vec<proto::IndexInfo> = indexes
+            .iter()
+            .map(|idx| proto::IndexInfo {
+                field: idx.field.clone(),
+                unique: idx.unique,
+            })
+            .collect();
+        Ok(Response::new(proto::ListIndexesResponse { indexes: infos }))
     }
 
-    // ── Schema ops ────────────────────────────
+    // ---- Schema ops ------------------------------------------
 
     async fn set_schema(
         &self,
@@ -786,16 +742,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.set_schema(&db, &col, &schema))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.set_schema(&db, &col, &schema))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn get_schema(
@@ -809,13 +761,13 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.get_schema(&db, &col))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let result = tokio::task::spawn_blocking(move || mgr.get_schema(&db, &col))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
         match result {
-            Ok(Ok(Some(schema))) => {
+            Some(schema) => {
                 let json = serde_json::to_string(&schema.to_json())
                     .map_err(|e| Status::internal(e.to_string()))?;
                 Ok(Response::new(proto::GetSchemaResponse {
@@ -823,12 +775,10 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                     schema_json: json,
                 }))
             }
-            Ok(Ok(None)) => Ok(Response::new(proto::GetSchemaResponse {
+            None => Ok(Response::new(proto::GetSchemaResponse {
                 found: false,
                 schema_json: String::new(),
             })),
-            Ok(Err(e)) => Err(Status::not_found(e)),
-            Err(e) => Err(Status::internal(e.to_string())),
         }
     }
 
@@ -846,19 +796,15 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.drop_schema(&db, &col))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.drop_schema(&db, &col))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
-    // ── Transaction ops ───────────────────────
+    // ---- Transaction ops -------------------------------------
 
     async fn begin_tx(
         &self,
@@ -888,16 +834,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let tx_id = req.tx_id;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.commit_transaction(&tx_id))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.commit_transaction(&tx_id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(Ok(())) => ok_status(),
-            Ok(Err(e)) => err_status(e),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        ok_status()
     }
 
     async fn rollback_tx(
@@ -910,15 +852,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let tx_id = req.tx_id;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.rollback_transaction(&tx_id))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.rollback_transaction(&tx_id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(()) => ok_status(),
-            Err(e) => err_status(e),
-        }
+        ok_status()
     }
 
     async fn tx_insert(
@@ -939,15 +878,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.tx_insert(&tx_id, db, col, doc))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.tx_insert(&tx_id, db, col, doc))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(()) => ok_status(),
-            Err(e) => err_status(e),
-        }
+        ok_status()
     }
 
     async fn tx_update(
@@ -969,15 +905,12 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let col = req.collection;
         let id = req.id;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.tx_update(&tx_id, db, col, id, patch))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.tx_update(&tx_id, db, col, id, patch))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(()) => ok_status(),
-            Err(e) => err_status(e),
-        }
+        ok_status()
     }
 
     async fn tx_delete(
@@ -996,19 +929,16 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let col = req.collection;
         let id = req.id;
 
-        let result =
-            tokio::task::spawn_blocking(move || mgr.tx_delete(&tx_id, db, col, id))
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || mgr.tx_delete(&tx_id, db, col, id))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
 
-        match result {
-            Ok(()) => ok_status(),
-            Err(e) => err_status(e),
-        }
+        ok_status()
     }
 }
 
-// ─── Helpers ─────────────────────────────────
+// ---- Helpers -------------------------------------------------
 
 fn ok_status() -> Result<Response<proto::StatusResponse>, Status> {
     Ok(Response::new(proto::StatusResponse {
