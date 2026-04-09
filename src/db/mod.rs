@@ -1,4 +1,5 @@
 pub mod aggregation;
+pub mod changefeed;
 pub mod database;
 pub mod error;
 pub mod filter;
@@ -7,6 +8,7 @@ pub mod planner;
 pub mod schema;
 pub mod transaction;
 
+pub use changefeed::ChangeFeed;
 pub use database::{DatabaseManager, QueryOptions};
 pub use error::VantaError;
 pub use filter::matches_filter;
