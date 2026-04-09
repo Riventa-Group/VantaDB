@@ -1,10 +1,12 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::db::{CollectionSchema, QueryOptions, VantaError};
 use super::auth_interceptor::{extract_auth, AuthContext};
+use super::metrics::record_op;
 use super::proto;
 use super::service::{VantaDbServiceImpl, ok_status, docs_response, to_query_options, require_read, require_write, require_admin, vanta_err};
 
@@ -16,6 +18,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::DatabaseRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_admin(&self.acl_manager, &ctx, &req.database, None)?;
@@ -28,7 +31,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        self.metrics.gauge_inc("databases_count");
         self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "create_database", Some(&req.database), None, "{}", true, None);
+        record_op(&self.metrics, "create_database", start, true);
         ok_status()
     }
 
@@ -36,6 +41,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::DatabaseRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_admin(&self.acl_manager, &ctx, &req.database, None)?;
@@ -48,7 +54,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        self.metrics.gauge_dec("databases_count");
         self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "drop_database", Some(&req.database), None, "{}", true, None);
+        record_op(&self.metrics, "drop_database", start, true);
         ok_status()
     }
 
@@ -129,6 +137,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::InsertRequest>,
     ) -> Result<Response<proto::InsertResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -147,6 +156,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let success = result.is_ok();
         match result {
             Ok(ref id) => {
                 self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), &format!("{{\"_id\":\"{}\"}}", id), true, None);
@@ -155,6 +165,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
                 self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), "{}", false, Some(&e.to_string()));
             }
         }
+        record_op(&self.metrics, "insert", start, success);
 
         match result {
             Ok(id) => Ok(Response::new(proto::InsertResponse { success: true, id, error: String::new() })),
@@ -166,6 +177,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::FindByIdRequest>,
     ) -> Result<Response<proto::DocumentResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -179,6 +191,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        record_op(&self.metrics, "find_by_id", start, true);
         match result {
             Some(doc) => {
                 let json = serde_json::to_string(&doc).map_err(|e| Status::internal(e.to_string()))?;
@@ -192,6 +205,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::FindAllRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -205,6 +219,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        record_op(&self.metrics, "find_all", start, true);
         docs_response(docs, total)
     }
 
@@ -212,6 +227,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::FindWhereRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -231,6 +247,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(vanta_err)?;
 
+        record_op(&self.metrics, "find_where", start, true);
         docs_response(docs, total)
     }
 
@@ -238,6 +255,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::DeleteByIdRequest>,
     ) -> Result<Response<proto::DeleteResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -250,6 +268,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let success = result.is_ok();
+        record_op(&self.metrics, "delete_by_id", start, success);
         match result {
             Ok(found) => Ok(Response::new(proto::DeleteResponse { success: true, found, error: String::new() })),
             Err(e) => Ok(Response::new(proto::DeleteResponse { success: false, found: false, error: e.to_string() })),
@@ -260,6 +280,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::CountRequest>,
     ) -> Result<Response<proto::CountResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -272,6 +293,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        record_op(&self.metrics, "count", start, true);
         Ok(Response::new(proto::CountResponse { count: count as u64, error: String::new() }))
     }
 
@@ -279,6 +301,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::UpdateRequest>,
     ) -> Result<Response<proto::UpdateResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -294,6 +317,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let success = result.is_ok();
+        record_op(&self.metrics, "update", start, success);
         match result {
             Ok(found) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: if found { 1 } else { 0 }, error: String::new() })),
             Err(e) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: e.to_string() })),
@@ -304,6 +329,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::UpdateWhereRequest>,
     ) -> Result<Response<proto::UpdateResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_write(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -320,6 +346,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let success = result.is_ok();
+        record_op(&self.metrics, "update_where", start, success);
         match result {
             Ok(count) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: count, error: String::new() })),
             Err(e) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: e.to_string() })),
@@ -330,6 +358,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::QueryRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -346,6 +375,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .map_err(|e| Status::internal(e.to_string()))?
             .map_err(vanta_err)?;
 
+        record_op(&self.metrics, "query", start, true);
         docs_response(docs, total)
     }
 
@@ -353,6 +383,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::AggregateRequest>,
     ) -> Result<Response<proto::AggregateResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
@@ -367,6 +398,8 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let success = result.is_ok();
+        record_op(&self.metrics, "aggregate", start, success);
         match result {
             Ok(results) => {
                 let results_json: Result<Vec<String>, _> = results.iter().map(serde_json::to_string).collect();
@@ -484,10 +517,13 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::TxResponse>, Status> {
+        let start = Instant::now();
         let _ctx = extract_auth(&request)?;
         let mgr = Arc::clone(&self.db_manager);
         let tx_id = tokio::task::spawn_blocking(move || mgr.begin_transaction())
             .await.map_err(|e| Status::internal(e.to_string()))?;
+        self.metrics.gauge_inc("active_transactions");
+        record_op(&self.metrics, "begin_tx", start, true);
         Ok(Response::new(proto::TxResponse { tx_id }))
     }
 
@@ -495,6 +531,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::TxRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
+        let start = Instant::now();
         let ctx = extract_auth(&request)?;
         if !ctx.role.can_write() {
             return Err(Status::permission_denied("Write permission required"));
@@ -503,8 +540,13 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let tx_id = req.tx_id;
 
-        tokio::task::spawn_blocking(move || mgr.commit_transaction(&tx_id))
-            .await.map_err(|e| Status::internal(e.to_string()))?.map_err(vanta_err)?;
+        let result = tokio::task::spawn_blocking(move || mgr.commit_transaction(&tx_id))
+            .await.map_err(|e| Status::internal(e.to_string()))?;
+        self.metrics.gauge_dec("active_transactions");
+        let success = result.is_ok();
+        record_op(&self.metrics, "commit_tx", start, success);
+        if success { self.metrics.inc("tx_commits"); }
+        result.map_err(vanta_err)?;
         ok_status()
     }
 
@@ -512,6 +554,7 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         &self,
         request: Request<proto::TxRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
+        let start = Instant::now();
         let _ctx = extract_auth(&request)?;
         let req = request.into_inner();
         let mgr = Arc::clone(&self.db_manager);
@@ -519,6 +562,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
 
         tokio::task::spawn_blocking(move || mgr.rollback_transaction(&tx_id))
             .await.map_err(|e| Status::internal(e.to_string()))?.map_err(vanta_err)?;
+        self.metrics.gauge_dec("active_transactions");
+        self.metrics.inc("tx_rollbacks");
+        record_op(&self.metrics, "rollback_tx", start, true);
         ok_status()
     }
 

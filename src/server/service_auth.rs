@@ -4,6 +4,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{Permission, Role};
 use super::auth_interceptor::extract_auth_from_metadata;
+use super::metrics::record_op;
 use super::proto;
 use super::service::{VantaAuthServiceImpl, ok_status, err_status};
 
@@ -13,7 +14,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::AuthRequest>,
     ) -> Result<Response<proto::AuthResponse>, Status> {
-        let _start = Instant::now();
+        let start = Instant::now();
         self.metrics.inc("auth_attempts");
         if !self.global_auth_limiter.allow() {
             return Err(Status::resource_exhausted("Rate limit exceeded, try again later"));
@@ -57,6 +58,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
                     None, None, "{}", true, None,
                 );
                 let token = self.jwt_manager.create_token(&user.username, &user.role);
+                record_op(&self.metrics, "authenticate", start, true);
                 Ok(Response::new(proto::AuthResponse {
                     success: true,
                     token,
@@ -71,6 +73,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
                     &username, "", "authenticate",
                     None, None, "{}", false, Some("Invalid credentials"),
                 );
+                record_op(&self.metrics, "authenticate", start, false);
                 Ok(Response::new(proto::AuthResponse {
                     success: false,
                     token: String::new(),
