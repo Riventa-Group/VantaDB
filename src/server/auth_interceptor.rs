@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tonic::{Request, Status};
 
 use crate::auth::Role;
-use super::session::SessionStore;
+use super::session::JwtSessionManager;
 
 /// Injected into request extensions after successful token validation.
 #[derive(Clone, Debug)]
@@ -12,10 +12,10 @@ pub struct AuthContext {
 }
 
 /// Interceptor applied to the VantaDb service.
-/// Validates the Bearer token from the "authorization" metadata key.
+/// Validates the JWT from the "authorization" metadata key.
 #[derive(Clone)]
 pub struct AuthInterceptor {
-    pub session_store: Arc<SessionStore>,
+    pub jwt_manager: Arc<JwtSessionManager>,
 }
 
 impl tonic::service::Interceptor for AuthInterceptor {
@@ -29,7 +29,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
         let token = token.ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
 
         let (username, role) = self
-            .session_store
+            .jwt_manager
             .validate(&token)
             .ok_or_else(|| Status::unauthenticated("Invalid or expired token"))?;
 
@@ -50,7 +50,7 @@ pub fn extract_auth<T>(request: &Request<T>) -> Result<AuthContext, Status> {
 /// Helper to extract auth from metadata directly (for services without interceptor).
 pub fn extract_auth_from_metadata<T>(
     request: &Request<T>,
-    session_store: &SessionStore,
+    jwt_manager: &JwtSessionManager,
 ) -> Result<AuthContext, Status> {
     let token = request
         .metadata()
@@ -59,7 +59,7 @@ pub fn extract_auth_from_metadata<T>(
         .map(|s| s.strip_prefix("Bearer ").unwrap_or(s).to_string())
         .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
 
-    let (username, role) = session_store
+    let (username, role) = jwt_manager
         .validate(&token)
         .ok_or_else(|| Status::unauthenticated("Invalid or expired token"))?;
 

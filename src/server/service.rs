@@ -5,13 +5,13 @@ use crate::auth::{AuthManager, CertManager, Role};
 use crate::db::{CollectionSchema, DatabaseManager, QueryOptions, VantaError};
 use super::auth_interceptor::{extract_auth, extract_auth_from_metadata};
 use super::proto;
-use super::session::SessionStore;
+use super::session::JwtSessionManager;
 
 // ---- VantaAuth Service ---------------------------------------
 
 pub struct VantaAuthServiceImpl {
     pub auth_manager: Arc<AuthManager>,
-    pub session_store: Arc<SessionStore>,
+    pub jwt_manager: Arc<JwtSessionManager>,
     pub cert_manager: Arc<CertManager>,
 }
 
@@ -35,8 +35,8 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         match result {
             Ok(Some(user)) => {
                 let token = self
-                    .session_store
-                    .create_session(user.username.clone(), user.role.clone());
+                    .jwt_manager
+                    .create_token(&user.username, &user.role);
                 Ok(Response::new(proto::AuthResponse {
                     success: true,
                     token,
@@ -58,7 +58,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::CreateUserRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         if !ctx.role.can_admin() {
             return Err(Status::permission_denied("Admin role required"));
         }
@@ -89,7 +89,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::DeleteUserRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         if !ctx.role.is_root() {
             return Err(Status::permission_denied("Root role required"));
         }
@@ -113,7 +113,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::SetPasswordRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         let req = request.into_inner();
 
         if req.username != ctx.username && !ctx.role.can_admin() {
@@ -139,7 +139,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::ListUsersResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         if !ctx.role.can_admin() {
             return Err(Status::permission_denied("Admin role required"));
         }
@@ -157,7 +157,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::GetUserRequest>,
     ) -> Result<Response<proto::GetUserResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         let req = request.into_inner();
 
         if req.username != ctx.username && !ctx.role.can_admin() {
@@ -196,7 +196,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::IssueCertRequest>,
     ) -> Result<Response<proto::IssueCertResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         if !ctx.role.can_admin() {
             return Err(Status::permission_denied("Admin role required"));
         }
@@ -236,7 +236,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::RevokeCertRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         if !ctx.role.can_admin() {
             return Err(Status::permission_denied("Admin role required"));
         }
@@ -260,7 +260,7 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::ListCertsResponse>, Status> {
-        let ctx = extract_auth_from_metadata(&request, &self.session_store)?;
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
         if !ctx.role.can_admin() {
             return Err(Status::permission_denied("Admin role required"));
         }

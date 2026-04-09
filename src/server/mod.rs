@@ -12,7 +12,7 @@ use crate::db::DatabaseManager;
 use crate::storage::StorageEngine;
 use auth_interceptor::AuthInterceptor;
 use service::{VantaAuthServiceImpl, VantaDbServiceImpl};
-use session::SessionStore;
+use session::JwtSessionManager;
 
 pub mod proto {
     tonic::include_proto!("vantadb");
@@ -31,14 +31,14 @@ pub async fn start(
     // Bootstrap certificates (needed for cert management RPCs even without TLS)
     let cert_manager = CertManager::bootstrap(data_dir, Arc::new(engine))?;
 
-    let session_store = Arc::new(SessionStore::new(24));
+    let jwt_manager = Arc::new(JwtSessionManager::new(24));
     let auth_manager = Arc::new(auth);
     let db_manager = Arc::new(db_manager);
     let cert_manager = Arc::new(cert_manager);
 
     let auth_service = VantaAuthServiceImpl {
         auth_manager: Arc::clone(&auth_manager),
-        session_store: Arc::clone(&session_store),
+        jwt_manager: Arc::clone(&jwt_manager),
         cert_manager: Arc::clone(&cert_manager),
     };
 
@@ -47,7 +47,7 @@ pub async fn start(
     };
 
     let interceptor = AuthInterceptor {
-        session_store: Arc::clone(&session_store),
+        jwt_manager: Arc::clone(&jwt_manager),
     };
 
     let mut builder = Server::builder();
