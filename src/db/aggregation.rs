@@ -20,6 +20,20 @@ pub fn execute_pipeline(
     pipeline: &[Value],
     collection_resolver: &dyn Fn(&str) -> Vec<Value>,
 ) -> Result<Vec<Value>, String> {
+    let no_index = |_: &str, _: &str, _: &Value| -> Option<Vec<String>> { None };
+    execute_pipeline_with_indexes(docs, pipeline, collection_resolver, &no_index)
+}
+
+/// Execute a pipeline with optional index-accelerated $lookup.
+///
+/// `index_lookup_fn(foreign_col, field, value) -> Option<Vec<doc_id>>` returns
+/// matching doc IDs from an index if one exists on the foreign field.
+pub fn execute_pipeline_with_indexes(
+    docs: Vec<Value>,
+    pipeline: &[Value],
+    collection_resolver: &dyn Fn(&str) -> Vec<Value>,
+    index_lookup_fn: &dyn Fn(&str, &str, &Value) -> Option<Vec<String>>,
+) -> Result<Vec<Value>, String> {
     let mut result = docs;
 
     for (i, stage) in pipeline.iter().enumerate() {
@@ -40,7 +54,7 @@ pub fn execute_pipeline(
             "$project" => stage_project(result, arg)?,
             "$count" => stage_count(result, arg)?,
             "$unwind" => stage_unwind(result, arg)?,
-            "$lookup" => stage_lookup(result, arg, collection_resolver)?,
+            "$lookup" => stage_lookup(result, arg, collection_resolver, index_lookup_fn)?,
             _ => return Err(format!("Unknown pipeline stage: {}", name)),
         };
     }
@@ -360,6 +374,7 @@ fn stage_lookup(
     docs: Vec<Value>,
     spec: &Value,
     resolver: &dyn Fn(&str) -> Vec<Value>,
+    index_lookup_fn: &dyn Fn(&str, &str, &Value) -> Option<Vec<String>>,
 ) -> Result<Vec<Value>, String> {
     let obj = spec.as_object().ok_or("$lookup spec must be an object")?;
 
@@ -380,23 +395,65 @@ fn stage_lookup(
         .and_then(|v| v.as_str())
         .ok_or("$lookup requires 'as'")?;
 
-    let foreign_docs = resolver(from);
+    // Check if an index exists on the foreign field by probing with a dummy value.
+    // If index_lookup_fn returns Some for any value, we use indexed lookups.
+    let use_index = index_lookup_fn(from, foreign_field, &Value::Null).is_some();
 
-    Ok(docs
-        .into_iter()
-        .map(|doc| {
-            let local_val = doc.get(local_field);
-            let matches: Vec<Value> = foreign_docs
-                .iter()
-                .filter(|fd| fd.get(foreign_field) == local_val)
-                .cloned()
-                .collect();
-            if let Some(mut obj) = doc.as_object().cloned() {
-                obj.insert(as_field.to_string(), Value::Array(matches));
-                Value::Object(obj)
-            } else {
-                doc
-            }
-        })
-        .collect())
+    if use_index {
+        // Index-accelerated $lookup: O(n * log(m)) instead of O(n * m) (#19)
+        let foreign_docs = resolver(from);
+        // Build a quick id->doc map for resolving index hits
+        let foreign_by_id: std::collections::HashMap<&str, &Value> = foreign_docs
+            .iter()
+            .filter_map(|d| {
+                let id = d.get("_id")?.as_str()?;
+                Some((id, d))
+            })
+            .collect();
+
+        Ok(docs
+            .into_iter()
+            .map(|doc| {
+                let matches = if let Some(local_val) = doc.get(local_field) {
+                    if let Some(ids) = index_lookup_fn(from, foreign_field, local_val) {
+                        ids.iter()
+                            .filter_map(|id| foreign_by_id.get(id.as_str()).cloned())
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                if let Some(mut obj) = doc.as_object().cloned() {
+                    obj.insert(as_field.to_string(), Value::Array(matches));
+                    Value::Object(obj)
+                } else {
+                    doc
+                }
+            })
+            .collect())
+    } else {
+        // Fallback: O(n * m) nested loop join
+        let foreign_docs = resolver(from);
+
+        Ok(docs
+            .into_iter()
+            .map(|doc| {
+                let local_val = doc.get(local_field);
+                let matches: Vec<Value> = foreign_docs
+                    .iter()
+                    .filter(|fd| fd.get(foreign_field) == local_val)
+                    .cloned()
+                    .collect();
+                if let Some(mut obj) = doc.as_object().cloned() {
+                    obj.insert(as_field.to_string(), Value::Array(matches));
+                    Value::Object(obj)
+                } else {
+                    doc
+                }
+            })
+            .collect())
+    }
 }
