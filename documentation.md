@@ -1,6 +1,6 @@
 # VantaDB Documentation
 
-**Version 1.0.0** | Built by [Riventa Group](https://riventa.group)
+**Version 1.0.0** | Built by Neroph
 
 VantaDB is a high-performance document database engine written in Rust. It stores JSON documents in collections within databases, offers a MongoDB-compatible query language, and exposes both an interactive CLI shell and a gRPC wire protocol for programmatic access from any language.
 
