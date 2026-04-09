@@ -37,6 +37,7 @@ rustls-pemfile = "2"
 regex = "1"
 crc32c = "0.6"
 time = "0.3"
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tempfile = "3"
