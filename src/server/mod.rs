@@ -5,6 +5,8 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod service;
+pub mod service_auth;
+pub mod service_db;
 pub mod session;
 
 use std::sync::Arc;
