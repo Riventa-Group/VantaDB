@@ -27,6 +27,10 @@ service VantaAuth {
 
   // Audit log
   rpc QueryAuditLog (AuditLogRequest)  returns (AuditLogResponse);
+
+  // Metrics & health
+  rpc GetMetrics  (Empty)  returns (MetricsResponse);
+  rpc HealthCheck (Empty)  returns (HealthResponse);
 }
 
 // ─── Database Service ────────────────────────
@@ -231,6 +235,34 @@ message AuditEntry {
   string detail     = 8;
   bool   success    = 9;
   string error      = 10;
+}
+
+// ─── Metrics & health messages ───────────────
+
+message MetricsResponse {
+  repeated MetricEntry counters   = 1;
+  repeated MetricEntry gauges     = 2;
+  repeated LatencyEntry latencies = 3;
+}
+
+message MetricEntry {
+  string name  = 1;
+  uint64 value = 2;
+}
+
+message LatencyEntry {
+  string operation = 1;
+  uint64 p50_us    = 2;
+  uint64 p95_us    = 3;
+  uint64 p99_us    = 4;
+}
+
+message HealthResponse {
+  string status              = 1;  // "healthy", "degraded", "unhealthy"
+  uint64 uptime_seconds      = 2;
+  uint64 database_count      = 3;
+  uint64 active_transactions = 4;
+  string version             = 5;
 }
 
 // ─── Database messages ───────────────────────
