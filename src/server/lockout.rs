@@ -1,10 +1,6 @@
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 
-const MAX_ATTEMPTS: u32 = 5;
-const WINDOW: Duration = Duration::from_secs(5 * 60);     // 5 minutes
-const LOCKOUT: Duration = Duration::from_secs(15 * 60);   // 15 minutes
-
 struct LoginRecord {
     attempts: Vec<Instant>,
     locked_until: Option<Instant>,
@@ -13,12 +9,18 @@ struct LoginRecord {
 /// Tracks failed login attempts per username and enforces lockout.
 pub struct LockoutTracker {
     records: DashMap<String, LoginRecord>,
+    max_attempts: u32,
+    window: Duration,
+    lockout: Duration,
 }
 
 impl LockoutTracker {
-    pub fn new() -> Self {
+    pub fn new(max_attempts: u32, window_secs: u64, lockout_secs: u64) -> Self {
         Self {
             records: DashMap::new(),
+            max_attempts,
+            window: Duration::from_secs(window_secs),
+            lockout: Duration::from_secs(lockout_secs),
         }
     }
 
@@ -56,11 +58,11 @@ impl LockoutTracker {
         }
 
         // Prune attempts outside the window
-        record.attempts.retain(|t| now.duration_since(*t) < WINDOW);
+        record.attempts.retain(|t| now.duration_since(*t) < self.window);
         record.attempts.push(now);
 
-        if record.attempts.len() as u32 >= MAX_ATTEMPTS {
-            record.locked_until = Some(now + LOCKOUT);
+        if record.attempts.len() as u32 >= self.max_attempts {
+            record.locked_until = Some(now + self.lockout);
             return true;
         }
 
@@ -79,7 +81,7 @@ mod tests {
 
     #[test]
     fn test_no_lockout_under_threshold() {
-        let tracker = LockoutTracker::new();
+        let tracker = LockoutTracker::new(5, 300, 900);
         assert!(tracker.check("alice").is_none());
 
         for _ in 0..4 {
@@ -90,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_lockout_at_threshold() {
-        let tracker = LockoutTracker::new();
+        let tracker = LockoutTracker::new(5, 300, 900);
         for _ in 0..4 {
             assert!(!tracker.record_failure("bob"));
         }
@@ -101,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_clear_resets_lockout() {
-        let tracker = LockoutTracker::new();
+        let tracker = LockoutTracker::new(5, 300, 900);
         for _ in 0..5 {
             tracker.record_failure("carol");
         }
@@ -113,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_independent_users() {
-        let tracker = LockoutTracker::new();
+        let tracker = LockoutTracker::new(5, 300, 900);
         for _ in 0..5 {
             tracker.record_failure("dave");
         }

@@ -15,6 +15,7 @@ use colored::*;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use crate::auth::{AclManager, AuthManager, CertManager};
+use crate::config::Config;
 use crate::db::DatabaseManager;
 use crate::storage::StorageEngine;
 use audit::AuditLogger;
@@ -37,6 +38,7 @@ pub async fn start(
     data_dir: &Path,
     engine: StorageEngine,
     use_tls: bool,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
@@ -45,16 +47,27 @@ pub async fn start(
     let cert_manager = CertManager::bootstrap(data_dir, Arc::clone(&engine))?;
     let acl_manager = AclManager::new(Arc::clone(&engine))?;
 
-    let jwt_manager = Arc::new(JwtSessionManager::new(24));
+    // Use config values for subsystem initialization
+    let jwt_manager = Arc::new(JwtSessionManager::new(config.auth.jwt_ttl_hours));
     let auth_manager = Arc::new(auth);
     let db_manager = Arc::new(db_manager);
     let cert_manager = Arc::new(cert_manager);
     let acl_manager = Arc::new(acl_manager);
     let audit_logger = Arc::new(AuditLogger::new(Arc::clone(&engine))?);
     let metrics = Arc::new(MetricsCollector::new());
-    let lockout_tracker = Arc::new(LockoutTracker::new());
-    let global_limiter = Arc::new(GlobalRateLimiter::new(10.0, 10.0));
-    let ip_limiter = Arc::new(RateLimiter::new(3.0, 3.0));
+    let lockout_tracker = Arc::new(LockoutTracker::new(
+        config.auth.lockout_max_attempts,
+        config.auth.lockout_window_secs,
+        config.auth.lockout_duration_secs,
+    ));
+    let global_limiter = Arc::new(GlobalRateLimiter::new(
+        config.rate_limit.global_rps,
+        config.rate_limit.global_rps,
+    ));
+    let ip_limiter = Arc::new(RateLimiter::new(
+        config.rate_limit.per_ip_rps,
+        config.rate_limit.per_ip_rps,
+    ));
 
     let auth_service = VantaAuthServiceImpl {
         auth_manager: Arc::clone(&auth_manager),
@@ -81,10 +94,13 @@ pub async fn start(
         jwt_manager: Arc::clone(&jwt_manager),
     };
 
-    // Start background scheduler for compaction, GC, and transaction reaping
+    // Start background scheduler with config intervals
     let _scheduler = BackgroundScheduler::start(
         Arc::clone(&db_manager),
         Arc::clone(&metrics),
+        config.scheduler.reap_interval_secs,
+        config.scheduler.gc_interval_secs,
+        config.scheduler.compact_interval_secs,
     );
 
     let mut builder = Server::builder();

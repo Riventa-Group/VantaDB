@@ -5,14 +5,10 @@ use tokio::task::JoinHandle;
 use crate::db::DatabaseManager;
 use super::metrics::MetricsCollector;
 
-const REAP_INTERVAL: Duration = Duration::from_secs(10);
-const GC_INTERVAL: Duration = Duration::from_secs(60);
-const COMPACT_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
 /// Background scheduler for periodic maintenance tasks:
-/// - Transaction reaping (every 10s)
-/// - MVCC garbage collection (every 60s)
-/// - WAL compaction (every 5min)
+/// - Transaction reaping
+/// - MVCC garbage collection
+/// - WAL compaction
 pub struct BackgroundScheduler {
     handle: JoinHandle<()>,
 }
@@ -21,11 +17,14 @@ impl BackgroundScheduler {
     pub fn start(
         db_manager: Arc<DatabaseManager>,
         metrics: Arc<MetricsCollector>,
+        reap_secs: u64,
+        gc_secs: u64,
+        compact_secs: u64,
     ) -> Self {
         let handle = tokio::spawn(async move {
-            let mut reap_interval = tokio::time::interval(REAP_INTERVAL);
-            let mut gc_interval = tokio::time::interval(GC_INTERVAL);
-            let mut compact_interval = tokio::time::interval(COMPACT_INTERVAL);
+            let mut reap_interval = tokio::time::interval(Duration::from_secs(reap_secs));
+            let mut gc_interval = tokio::time::interval(Duration::from_secs(gc_secs));
+            let mut compact_interval = tokio::time::interval(Duration::from_secs(compact_secs));
 
             // Don't run immediately on startup — tick once to consume the initial instant
             reap_interval.tick().await;
@@ -103,7 +102,7 @@ mod tests {
         let mgr = Arc::new(DatabaseManager::new(&data_path).unwrap());
         let metrics = Arc::new(MetricsCollector::new());
 
-        let scheduler = BackgroundScheduler::start(mgr, metrics);
+        let scheduler = BackgroundScheduler::start(mgr, metrics, 10, 60, 300);
 
         // Let it run briefly
         tokio::time::sleep(Duration::from_millis(50)).await;
