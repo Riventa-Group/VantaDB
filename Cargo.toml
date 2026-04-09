@@ -30,10 +30,13 @@ dashmap = "5"
 ahash = "0.8"
 mimalloc = { version = "0.1", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
+rcgen = { version = "0.13", features = ["pem"] }
+rustls-pemfile = "2"
 regex = "1"
 crc32c = "0.6"
+time = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

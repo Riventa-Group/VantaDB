@@ -1,7 +1,7 @@
 use colored::*;
 use std::time::Instant;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::Request;
 
 use crate::server::proto;
@@ -66,23 +66,44 @@ fn auth_req<T>(token: &str, inner: T) -> Request<T> {
     req
 }
 
-pub async fn run(port: u16, username: &str, password: &str) -> bool {
-    let addr = format!("http://127.0.0.1:{}", port);
+pub async fn run(
+    port: u16,
+    username: &str,
+    password: &str,
+    tls_config: Option<&(String, String, String)>,
+) -> bool {
+    let (_scheme, addr) = if tls_config.is_some() {
+        ("https", format!("https://localhost:{}", port))
+    } else {
+        ("http", format!("http://127.0.0.1:{}", port))
+    };
 
     println!(
-        "  {} Self-check targeting {}",
+        "  {} Self-check targeting {} {}",
         "→".truecolor(120, 80, 255),
-        addr.bold().truecolor(120, 200, 120)
+        addr.bold().truecolor(120, 200, 120),
+        if tls_config.is_some() { "(mTLS)" } else { "(plain)" },
     );
     println!();
 
     // ── Connect ──────────────────────────────────
 
-    let channel = match Channel::from_shared(addr.clone())
-        .unwrap()
-        .connect()
-        .await
-    {
+    let mut endpoint = Channel::from_shared(addr.clone()).unwrap();
+
+    if let Some((cert_path, key_path, ca_path)) = tls_config {
+        let ca_pem = std::fs::read(ca_path).expect("Failed to read CA cert");
+        let cert_pem = std::fs::read(cert_path).expect("Failed to read client cert");
+        let key_pem = std::fs::read(key_path).expect("Failed to read client key");
+
+        let tls = ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(cert_pem, key_pem));
+
+        endpoint = endpoint.tls_config(tls).expect("Failed to configure TLS");
+    }
+
+    let channel = match endpoint.connect().await {
         Ok(ch) => ch,
         Err(e) => {
             println!(

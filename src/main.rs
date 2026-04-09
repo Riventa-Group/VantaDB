@@ -54,19 +54,35 @@ struct Cli {
     /// Password for self-check authentication
     #[arg(long)]
     password: Option<String>,
+
+    /// Disable TLS (plain-text gRPC, for development only)
+    #[arg(long)]
+    no_tls: bool,
+
+    /// Path to client TLS certificate PEM (for self-check mTLS)
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Path to client TLS key PEM (for self-check mTLS)
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Path to CA certificate PEM (for self-check TLS verification)
+    #[arg(long)]
+    tls_ca: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
     if cli.self_check {
-        run_self_check(cli.user, cli.password, cli.port);
+        run_self_check(cli.user, cli.password, cli.port, cli.tls_cert, cli.tls_key, cli.tls_ca);
     } else if cli.benchmark {
         run_benchmark();
     } else if cli.status {
         run_status();
     } else if cli.serve {
-        run_server(cli.port);
+        run_server(cli.port, cli.no_tls);
     } else {
         run_login();
     }
@@ -165,10 +181,10 @@ fn run_status() {
     println!();
 }
 
-fn run_server(port: u16) {
+fn run_server(port: u16, no_tls: bool) {
     Shell::print_banner();
 
-    let (_engine, auth, db_manager) = match Shell::init() {
+    let (engine, auth, db_manager) = match Shell::init() {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
@@ -180,16 +196,20 @@ fn run_server(port: u16) {
         }
     };
 
+    let data_dir = Shell::data_dir();
+    let use_tls = !no_tls;
+
     println!(
-        "  {} Starting gRPC server on port {}...",
+        "  {} Starting gRPC{} server on port {}...",
         "→".truecolor(120, 80, 255),
+        if use_tls { "+TLS" } else { "" },
         port.to_string().bold()
     );
     println!();
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async move {
-        if let Err(e) = server::start(auth, db_manager, port).await {
+        if let Err(e) = server::start(auth, db_manager, port, &data_dir, engine, use_tls).await {
             eprintln!(
                 "  {} Server error: {}",
                 "✗".red().bold(),
@@ -200,7 +220,14 @@ fn run_server(port: u16) {
     });
 }
 
-fn run_self_check(user: Option<String>, password: Option<String>, port: u16) {
+fn run_self_check(
+    user: Option<String>,
+    password: Option<String>,
+    port: u16,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_ca: Option<String>,
+) {
     let user = match user {
         Some(u) => u,
         None => {
@@ -222,11 +249,23 @@ fn run_self_check(user: Option<String>, password: Option<String>, port: u16) {
         }
     };
 
+    let tls_config = match (&tls_cert, &tls_key, &tls_ca) {
+        (Some(cert), Some(key), Some(ca)) => Some((cert.clone(), key.clone(), ca.clone())),
+        (None, None, None) => None,
+        _ => {
+            eprintln!(
+                "  {} --tls-cert, --tls-key, and --tls-ca must all be provided together",
+                "✗".red().bold()
+            );
+            process::exit(1);
+        }
+    };
+
     Shell::print_banner();
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async move {
-        let success = selfcheck::run(port, &user, &password).await;
+        let success = selfcheck::run(port, &user, &password, tls_config.as_ref()).await;
         if !success {
             process::exit(1);
         }

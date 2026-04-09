@@ -13,6 +13,12 @@ service VantaAuth {
   rpc SetPassword  (SetPasswordRequest) returns (StatusResponse);
   rpc ListUsers    (Empty)             returns (ListUsersResponse);
   rpc GetUser      (GetUserRequest)    returns (GetUserResponse);
+
+  // Certificate management (mTLS)
+  rpc IssueCert    (IssueCertRequest)  returns (IssueCertResponse);
+  rpc RevokeCert   (RevokeCertRequest) returns (StatusResponse);
+  rpc ListCerts    (Empty)             returns (ListCertsResponse);
+  rpc GetCaCert    (Empty)             returns (CaCertResponse);
 }
 
 // ─── Database Service ────────────────────────
@@ -119,6 +125,40 @@ message GetUserResponse {
 
 message ListUsersResponse {
   repeated string usernames = 1;
+}
+
+// ─── Certificate messages ────────────────────
+
+message IssueCertRequest {
+  string username = 1;
+}
+
+message IssueCertResponse {
+  bool   success  = 1;
+  string cert_pem = 2;
+  string key_pem  = 3;
+  string ca_pem   = 4;
+  string serial   = 5;
+  string error    = 6;
+}
+
+message RevokeCertRequest {
+  string serial = 1;
+}
+
+message ListCertsResponse {
+  repeated CertInfoMsg certs = 1;
+}
+
+message CertInfoMsg {
+  string serial    = 1;
+  string username  = 2;
+  string issued_at = 3;
+  bool   revoked   = 4;
+}
+
+message CaCertResponse {
+  string ca_pem = 1;
 }
 
 // ─── Database messages ───────────────────────
