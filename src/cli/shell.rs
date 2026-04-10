@@ -1,11 +1,13 @@
 use colored::*;
 use dialoguer::{Input, Password};
-use std::io::{self, Write};
+use rustyline::error::ReadlineError;
+use rustyline::Editor;
+use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
-
 use crate::auth::{AclManager, AuthManager, CertManager, Role, User};
+use crate::cli::completer::VantaCompleter;
 use crate::cli::handler;
 use crate::db::DatabaseManager;
 use crate::server::audit::AuditLogger;
@@ -188,48 +190,85 @@ impl Shell {
         );
         println!();
 
+        let mut completer = VantaCompleter::new();
+        completer.update_databases(self.db_manager.list_databases());
+
+        let mut rl = Editor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        rl.set_helper(Some(completer));
+
+        // Load persistent history
+        let history_path = self.data_dir.join("history.txt");
+        let _ = rl.load_history(&history_path);
+
         loop {
             let prompt = self.build_prompt();
-            print!("{}", prompt);
-            io::stdout().flush()?;
 
-            let mut input = String::new();
-            match io::stdin().read_line(&mut input) {
-                Ok(0) => break, // EOF
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("  {} Read error: {}", "✗".red().bold(), e);
-                    continue;
+            // Update completer with current databases and collections
+            if let Some(helper) = rl.helper_mut() {
+                helper.update_databases(self.db_manager.list_databases());
+                if let Some(ref db) = self.current_db {
+                    if let Ok(cols) = self.db_manager.list_collections(db) {
+                        helper.update_collections(cols);
+                    }
                 }
             }
 
-            let input = input.trim();
-            if input.is_empty() {
-                continue;
-            }
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    let input = line.trim();
+                    if input.is_empty() {
+                        continue;
+                    }
 
-            let start = Instant::now();
-            let should_exit = handler::handle_command(self, input)?;
-            let elapsed = start.elapsed();
+                    rl.add_history_entry(input)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-            if elapsed.as_millis() > 0 {
-                println!(
-                    "  {}",
-                    format!("({:.2}ms)", elapsed.as_secs_f64() * 1000.0).dimmed()
-                );
-            }
+                    let start = Instant::now();
+                    let should_exit = handler::handle_command(self, input)?;
+                    let elapsed = start.elapsed();
 
-            if should_exit {
-                println!();
-                println!(
-                    "  {} {}",
-                    "←".truecolor(120, 80, 255),
-                    "Goodbye.".dimmed()
-                );
-                println!();
-                break;
+                    if elapsed.as_millis() > 0 {
+                        println!(
+                            "  {}",
+                            format!("({:.2}ms)", elapsed.as_secs_f64() * 1000.0).dimmed()
+                        );
+                    }
+
+                    if should_exit {
+                        println!();
+                        println!(
+                            "  {} {}",
+                            "←".truecolor(120, 80, 255),
+                            "Goodbye.".dimmed()
+                        );
+                        println!();
+                        break;
+                    }
+                }
+                Err(ReadlineError::Interrupted) => {
+                    // Ctrl+C — ignore, print new prompt
+                    continue;
+                }
+                Err(ReadlineError::Eof) => {
+                    // Ctrl+D — exit
+                    println!();
+                    println!(
+                        "  {} {}",
+                        "←".truecolor(120, 80, 255),
+                        "Goodbye.".dimmed()
+                    );
+                    println!();
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("  {} Read error: {}", "✗".red().bold(), e);
+                    break;
+                }
             }
         }
+
+        // Save history
+        let _ = rl.save_history(&history_path);
 
         Ok(())
     }
@@ -250,8 +289,14 @@ impl Shell {
             None => String::new(),
         };
 
+        let tx_part = if self.current_tx.is_some() {
+            format!(" {}", "[tx]".truecolor(255, 180, 50))
+        } else {
+            String::new()
+        };
+
         let arrow = "❯".truecolor(120, 80, 255).bold();
 
-        format!("  {}{} {} ", user_part, db_part, arrow)
+        format!("  {}{}{} {} ", user_part, db_part, tx_part, arrow)
     }
 }
