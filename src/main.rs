@@ -6,6 +6,7 @@ mod bench;
 mod cli;
 mod config;
 mod db;
+mod raft;
 mod selfcheck;
 mod server;
 mod storage;
