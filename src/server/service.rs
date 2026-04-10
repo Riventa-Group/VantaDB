@@ -4,7 +4,7 @@ use tonic::{Response, Status};
 
 use crate::auth::{AclManager, AuthManager, CertManager};
 use crate::db::{DatabaseManager, QueryOptions, VantaError};
-use crate::raft::{RaftOp, RaftResponse, VantaRaft};
+use crate::raft::{LeaderForwarder, RaftOp, RaftResponse, VantaRaft};
 use super::auth_interceptor::AuthContext;
 use super::proto;
 use super::audit::AuditLogger;
@@ -37,10 +37,11 @@ pub struct VantaDbServiceImpl {
     pub audit_logger: Arc<AuditLogger>,
     pub metrics: Arc<MetricsCollector>,
     pub raft: Option<Arc<VantaRaft>>,
+    pub forwarder: Option<Arc<LeaderForwarder>>,
 }
 
 /// Propose a write through Raft if clustered, or execute directly if single-node.
-/// Returns the RaftResponse on success, or a gRPC Status on error.
+/// On followers, returns UNAVAILABLE with leader address hint for client retry.
 pub async fn raft_propose_or_direct<F>(
     raft: &Option<Arc<VantaRaft>>,
     op: RaftOp,
@@ -57,7 +58,15 @@ where
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("ForwardToLeader") {
-                        Err(Status::unavailable(format!("Not leader: {}", msg)))
+                        // Extract leader info if available and include in error
+                        let metrics = r.metrics().borrow().clone();
+                        let leader_hint = metrics.current_leader
+                            .map(|id| format!(" (leader_id={})", id))
+                            .unwrap_or_default();
+                        Err(Status::unavailable(format!(
+                            "Not leader, retry on another node{}",
+                            leader_hint
+                        )))
                     } else {
                         Err(Status::internal(format!("Raft error: {}", msg)))
                     }
