@@ -48,6 +48,7 @@ pub fn handle_command(shell: &mut Shell, input: &str) -> io::Result<bool> {
         "metrics" => super::cmd_ops::cmd_metrics(shell),
         "health" => super::cmd_ops::cmd_health(shell),
         "backup" => super::cmd_ops::cmd_backup(shell, &parts),
+        "cluster" => super::cmd_ops::cmd_cluster(shell),
         _ => {
             println!(
                 "  {} Unknown command: {}. Type {} for help.",

@@ -555,4 +555,26 @@ impl proto::vanta_auth_server::VantaAuth for VantaAuthServiceImpl {
 
         ok_status()
     }
+
+    // ---- Cluster status -----------------------------------------
+
+    async fn cluster_status(
+        &self,
+        request: Request<proto::Empty>,
+    ) -> Result<Response<proto::ClusterStatusResponse>, Status> {
+        let ctx = extract_auth_from_metadata(&request, &self.jwt_manager)?;
+        if !ctx.role.can_admin() {
+            return Err(Status::permission_denied("Admin role required"));
+        }
+
+        // In single-node mode, return this node as the only member
+        Ok(Response::new(proto::ClusterStatusResponse {
+            nodes: vec![proto::ClusterNodeInfo {
+                node_id: 0,
+                addr: "localhost".to_string(),
+                role: "leader".to_string(),
+            }],
+            leader_id: 0,
+        }))
+    }
 }

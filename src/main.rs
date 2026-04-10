@@ -80,6 +80,14 @@ struct Cli {
     /// Dump effective configuration and exit
     #[arg(long = "dump-config")]
     dump_config: bool,
+
+    /// Join an existing cluster (address of any cluster node)
+    #[arg(long)]
+    join: Option<String>,
+
+    /// Leave the cluster this node belongs to
+    #[arg(long)]
+    leave: bool,
 }
 
 fn main() {
