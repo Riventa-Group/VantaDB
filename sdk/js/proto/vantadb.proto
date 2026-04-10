@@ -1,6 +1,19 @@
 syntax = "proto3";
 package vantadb;
 
+// ─── Raft Consensus Service ─────────────────
+// Internal cluster communication — not for client use.
+
+service VantaRaft {
+  rpc AppendEntries  (RaftMessage) returns (RaftMessage);
+  rpc InstallSnapshot (RaftMessage) returns (RaftMessage);
+  rpc Vote           (RaftMessage) returns (RaftMessage);
+}
+
+message RaftMessage {
+  bytes data = 1;
+}
+
 // ─── Authentication Service ──────────────────
 // Authenticate is callable without a token.
 // All other RPCs require a valid session token in the

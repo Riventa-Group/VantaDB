@@ -1,7 +1,11 @@
+pub mod network;
+pub mod proto_service;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
 
+pub use network::VantaNetworkFactory;
+pub use proto_service::VantaRaftService;
 pub use state_machine::VantaStateMachine;
 pub use storage::VantaLogStore;
 pub use types::{RaftOp, RaftResponse, VantaRaft, VantaRaftConfig};

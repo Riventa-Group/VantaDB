@@ -11,7 +11,23 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     pub scheduler: SchedulerConfig,
     pub changefeed: ChangefeedConfig,
+    pub cluster: Option<ClusterConfig>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    pub node_id: u64,
+    pub advertise_addr: String,
+    #[serde(default)]
+    pub peers: Vec<String>,
+    #[serde(default = "default_raft_port_offset")]
+    pub raft_port_offset: u16,
+    #[serde(default = "default_lease_duration")]
+    pub lease_duration_secs: u64,
+}
+
+fn default_raft_port_offset() -> u16 { 1 }
+fn default_lease_duration() -> u64 { 5 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -62,6 +78,7 @@ impl Default for Config {
             rate_limit: RateLimitConfig::default(),
             scheduler: SchedulerConfig::default(),
             changefeed: ChangefeedConfig::default(),
+            cluster: None,
         }
     }
 }
