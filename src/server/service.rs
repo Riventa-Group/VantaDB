@@ -4,6 +4,7 @@ use tonic::{Response, Status};
 
 use crate::auth::{AclManager, AuthManager, CertManager};
 use crate::db::{DatabaseManager, QueryOptions, VantaError};
+use crate::raft::{RaftOp, RaftResponse, VantaRaft};
 use super::auth_interceptor::AuthContext;
 use super::proto;
 use super::audit::AuditLogger;
@@ -35,6 +36,42 @@ pub struct VantaDbServiceImpl {
     pub acl_manager: Arc<AclManager>,
     pub audit_logger: Arc<AuditLogger>,
     pub metrics: Arc<MetricsCollector>,
+    pub raft: Option<Arc<VantaRaft>>,
+}
+
+/// Propose a write through Raft if clustered, or execute directly if single-node.
+/// Returns the RaftResponse on success, or a gRPC Status on error.
+pub async fn raft_propose_or_direct<F>(
+    raft: &Option<Arc<VantaRaft>>,
+    op: RaftOp,
+    direct_fn: F,
+) -> Result<RaftResponse, Status>
+where
+    F: FnOnce() -> Result<RaftResponse, VantaError> + Send + 'static,
+{
+    match raft {
+        Some(r) => {
+            let result = r.client_write(op).await;
+            match result {
+                Ok(resp) => Ok(resp.data),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("ForwardToLeader") {
+                        Err(Status::unavailable(format!("Not leader: {}", msg)))
+                    } else {
+                        Err(Status::internal(format!("Raft error: {}", msg)))
+                    }
+                }
+            }
+        }
+        None => {
+            // Single-node mode: execute directly
+            tokio::task::spawn_blocking(direct_fn)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(|e| e.to_grpc_status())
+        }
+    }
 }
 
 // ---- Shared helpers ------------------------------------------
