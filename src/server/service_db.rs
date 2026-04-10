@@ -5,10 +5,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::db::{CollectionSchema, QueryOptions, VantaError};
+use crate::raft::{RaftOp, RaftResponse};
 use super::auth_interceptor::{extract_auth, AuthContext};
 use super::metrics::record_op;
 use super::proto;
-use super::service::{VantaDbServiceImpl, ok_status, docs_response, to_query_options, require_read, require_write, require_admin, vanta_err};
+use super::service::{VantaDbServiceImpl, ok_status, docs_response, to_query_options, require_read, require_write, require_admin, vanta_err, raft_propose_or_direct};
 
 #[tonic::async_trait]
 impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
@@ -26,10 +27,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database.clone();
 
-        tokio::task::spawn_blocking(move || mgr.create_database(&db))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(vanta_err)?;
+        raft_propose_or_direct(
+            &self.raft,
+            RaftOp::CreateDatabase { name: db.clone() },
+            move || mgr.create_database(&db).map(|_| RaftResponse::Ok),
+        ).await?;
 
         self.metrics.gauge_inc("databases_count");
         self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "create_database", Some(&req.database), None, "{}", true, None);
@@ -49,10 +51,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database.clone();
 
-        tokio::task::spawn_blocking(move || mgr.drop_database(&db))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(vanta_err)?;
+        raft_propose_or_direct(
+            &self.raft,
+            RaftOp::DropDatabase { name: db.clone() },
+            move || mgr.drop_database(&db).map(|_| RaftResponse::Ok),
+        ).await?;
 
         self.metrics.gauge_dec("databases_count");
         self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "drop_database", Some(&req.database), None, "{}", true, None);
@@ -86,10 +89,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        tokio::task::spawn_blocking(move || mgr.create_collection(&db, &col))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(vanta_err)?;
+        raft_propose_or_direct(
+            &self.raft,
+            RaftOp::CreateCollection { db: db.clone(), col: col.clone() },
+            move || mgr.create_collection(&db, &col).map(|_| RaftResponse::Ok),
+        ).await?;
 
         ok_status()
     }
@@ -106,10 +110,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
 
-        tokio::task::spawn_blocking(move || mgr.drop_collection(&db, &col))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(vanta_err)?;
+        raft_propose_or_direct(
+            &self.raft,
+            RaftOp::DropCollection { db: db.clone(), col: col.clone() },
+            move || mgr.drop_collection(&db, &col).map(|_| RaftResponse::Ok),
+        ).await?;
 
         ok_status()
     }
@@ -151,26 +156,29 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database.clone();
         let col = req.collection.clone();
+        let doc_clone = doc.clone();
 
-        let result = tokio::task::spawn_blocking(move || mgr.insert(&db, &col, doc))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let resp = raft_propose_or_direct(
+            &self.raft,
+            RaftOp::Insert { db: db.clone(), col: col.clone(), doc },
+            move || mgr.insert(&db, &col, doc_clone).map(|id| RaftResponse::InsertOk { id }),
+        ).await;
 
-        let success = result.is_ok();
-        match result {
-            Ok(ref id) => {
-                self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), &format!("{{\"_id\":\"{}\"}}", id), true, None);
-            }
-            Err(ref e) => {
-                self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), "{}", false, Some(&e.to_string()));
-            }
+        let (success, id, error) = match resp {
+            Ok(RaftResponse::InsertOk { id }) => (true, id, String::new()),
+            Ok(RaftResponse::Error { message }) => (false, String::new(), message),
+            Ok(_) => (true, String::new(), String::new()),
+            Err(e) => (false, String::new(), e.message().to_string()),
+        };
+
+        if success {
+            self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), &format!("{{\"_id\":\"{}\"}}", id), true, None);
+        } else {
+            self.audit_logger.record(&ctx.username, &ctx.role.to_string(), "insert", Some(&req.database), Some(&req.collection), "{}", false, Some(&error));
         }
         record_op(&self.metrics, "insert", start, success);
 
-        match result {
-            Ok(id) => Ok(Response::new(proto::InsertResponse { success: true, id, error: String::new() })),
-            Err(e) => Ok(Response::new(proto::InsertResponse { success: false, id: String::new(), error: e.to_string() })),
-        }
+        Ok(Response::new(proto::InsertResponse { success, id, error }))
     }
 
     async fn find_by_id(
@@ -264,15 +272,17 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let col = req.collection;
         let id = req.id;
 
-        let result = tokio::task::spawn_blocking(move || mgr.delete_by_id(&db, &col, &id))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let resp = raft_propose_or_direct(
+            &self.raft,
+            RaftOp::Delete { db: db.clone(), col: col.clone(), id: id.clone() },
+            move || mgr.delete_by_id(&db, &col, &id).map(|_| RaftResponse::Ok),
+        ).await;
 
-        let success = result.is_ok();
+        let success = resp.is_ok();
         record_op(&self.metrics, "delete_by_id", start, success);
-        match result {
-            Ok(found) => Ok(Response::new(proto::DeleteResponse { success: true, found, error: String::new() })),
-            Err(e) => Ok(Response::new(proto::DeleteResponse { success: false, found: false, error: e.to_string() })),
+        match resp {
+            Ok(_) => Ok(Response::new(proto::DeleteResponse { success: true, found: true, error: String::new() })),
+            Err(e) => Ok(Response::new(proto::DeleteResponse { success: false, found: false, error: e.message().to_string() })),
         }
     }
 
@@ -312,16 +322,23 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let db = req.database;
         let col = req.collection;
         let id = req.id;
+        let patch_clone = patch.clone();
 
-        let result = tokio::task::spawn_blocking(move || mgr.update_by_id(&db, &col, &id, patch))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let resp = raft_propose_or_direct(
+            &self.raft,
+            RaftOp::Update { db: db.clone(), col: col.clone(), id: id.clone(), patch },
+            move || mgr.update_by_id(&db, &col, &id, patch_clone).map(|found| {
+                if found { RaftResponse::Ok } else { RaftResponse::Error { message: "Not found".to_string() } }
+            }),
+        ).await;
 
-        let success = result.is_ok();
+        let success = resp.is_ok();
         record_op(&self.metrics, "update", start, success);
-        match result {
-            Ok(found) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: if found { 1 } else { 0 }, error: String::new() })),
-            Err(e) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: e.to_string() })),
+        match resp {
+            Ok(RaftResponse::Ok) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: 1, error: String::new() })),
+            Ok(RaftResponse::Error { message }) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: message })),
+            Ok(_) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: 1, error: String::new() })),
+            Err(e) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: e.message().to_string() })),
         }
     }
 
@@ -341,16 +358,20 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
+        let filter_clone = filter.clone();
+        let patch_clone = patch.clone();
 
-        let result = tokio::task::spawn_blocking(move || mgr.update_where(&db, &col, &filter, &patch))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let resp = raft_propose_or_direct(
+            &self.raft,
+            RaftOp::UpdateWhere { db: db.clone(), col: col.clone(), filter, patch },
+            move || mgr.update_where(&db, &col, &filter_clone, &patch_clone).map(|_| RaftResponse::Ok),
+        ).await;
 
-        let success = result.is_ok();
+        let success = resp.is_ok();
         record_op(&self.metrics, "update_where", start, success);
-        match result {
-            Ok(count) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: count, error: String::new() })),
-            Err(e) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: e.to_string() })),
+        match resp {
+            Ok(_) => Ok(Response::new(proto::UpdateResponse { success: true, modified_count: 1, error: String::new() })),
+            Err(e) => Ok(Response::new(proto::UpdateResponse { success: false, modified_count: 0, error: e.message().to_string() })),
         }
     }
 
