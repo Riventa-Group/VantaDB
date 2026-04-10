@@ -6,10 +6,11 @@ use tonic::{Request, Response, Status};
 
 use crate::db::{CollectionSchema, QueryOptions, VantaError};
 use crate::raft::{RaftOp, RaftResponse};
+use crate::raft::lease::extract_consistency;
 use super::auth_interceptor::{extract_auth, AuthContext};
 use super::metrics::record_op;
 use super::proto;
-use super::service::{VantaDbServiceImpl, ok_status, docs_response, to_query_options, require_read, require_write, require_admin, vanta_err, raft_propose_or_direct};
+use super::service::{VantaDbServiceImpl, ok_status, docs_response, to_query_options, require_read, require_write, require_admin, vanta_err, raft_propose_or_direct, check_read_permission};
 
 #[tonic::async_trait]
 impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
@@ -186,9 +187,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::FindByIdRequest>,
     ) -> Result<Response<proto::DocumentResponse>, Status> {
         let start = Instant::now();
+        let consistency = extract_consistency(&request);
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
+        check_read_permission(&self.raft, &self.lease, consistency)?;
         let mgr = Arc::clone(&self.db_manager);
         let db = req.database;
         let col = req.collection;
@@ -214,7 +217,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::FindAllRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
         let start = Instant::now();
+        let consistency = extract_consistency(&request);
         let ctx = extract_auth(&request)?;
+        check_read_permission(&self.raft, &self.lease, consistency)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let opts = to_query_options(req.pagination, req.sort);
@@ -236,7 +241,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::FindWhereRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
         let start = Instant::now();
+        let consistency = extract_consistency(&request);
         let ctx = extract_auth(&request)?;
+        check_read_permission(&self.raft, &self.lease, consistency)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let value: serde_json::Value = serde_json::from_str(&req.value_json)
@@ -291,7 +298,9 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::CountRequest>,
     ) -> Result<Response<proto::CountResponse>, Status> {
         let start = Instant::now();
+        let consistency = extract_consistency(&request);
         let ctx = extract_auth(&request)?;
+        check_read_permission(&self.raft, &self.lease, consistency)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
         let mgr = Arc::clone(&self.db_manager);
@@ -380,9 +389,11 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         request: Request<proto::QueryRequest>,
     ) -> Result<Response<proto::DocumentsResponse>, Status> {
         let start = Instant::now();
+        let consistency = extract_consistency(&request);
         let ctx = extract_auth(&request)?;
         let req = request.into_inner();
         require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
+        check_read_permission(&self.raft, &self.lease, consistency)?;
         let filter: serde_json::Value = serde_json::from_str(&req.filter_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid filter JSON: {}", e)))?;
 
