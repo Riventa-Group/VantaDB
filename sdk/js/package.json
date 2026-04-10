@@ -1,0 +1,21 @@
+{
+  "name": "vantadb-sdk",
+  "version": "1.0.0",
+  "description": "Official JavaScript/Node.js client SDK for VantaDB",
+  "main": "src/index.js",
+  "license": "MIT",
+  "author": "Riventa Group",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nerophlabs/VantaDB"
+  },
+  "keywords": ["database", "grpc", "client", "vantadb"],
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.0",
+    "@grpc/proto-loader": "^0.7.0"
+  },
+  "files": [
+    "src/",
+    "proto/"
+  ]
+}
