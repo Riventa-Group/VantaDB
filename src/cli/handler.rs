@@ -30,6 +30,7 @@ pub fn handle_command(shell: &mut Shell, input: &str) -> io::Result<bool> {
         "update" => cmd_update(shell, &parts),
         "query" => cmd_query(shell, &parts),
         "aggregate" | "agg" => cmd_aggregate(shell, &parts),
+        "explain" => cmd_explain(shell, &parts),
         "schema" => cmd_schema(shell, &parts),
         "begin" => cmd_begin_tx(shell),
         "commit" => cmd_commit_tx(shell),
@@ -133,6 +134,7 @@ fn cmd_help(_shell: &Shell) {
             vec![
                 ("query <col> <filter>", "Query with filter expression"),
                 ("  --sort/--desc/--page/--size", "  With pagination/sort"),
+                ("explain <col> <filter>", "Show query plan without executing"),
             ],
         ),
         (
@@ -771,6 +773,56 @@ fn cmd_query(shell: &Shell, parts: &[&str]) {
 }
 
 // ---- Aggregation command -------------------------------------
+
+fn cmd_explain(shell: &Shell, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!(
+            "  {} Usage: {} <collection> <filter_json>",
+            "✗".red().bold(),
+            "explain".bold()
+        );
+        return;
+    }
+
+    let db = match &shell.current_db {
+        Some(db) => db.clone(),
+        None => {
+            println!("  {} No database selected. Use: {}", "✗".red().bold(), "use <db>".bold());
+            return;
+        }
+    };
+
+    let collection = parts[1];
+    let filter_str = parts[2..].join(" ");
+    let filter: Value = match serde_json::from_str(&filter_str) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("  {} Invalid JSON filter: {}", "✗".red().bold(), e);
+            return;
+        }
+    };
+
+    match shell.db_manager.explain(&db, collection, &filter) {
+        Ok(plan) => {
+            println!();
+            println!("  {}", "QUERY PLAN".bold().truecolor(120, 80, 255));
+            println!("  {}", "─────────────────────────────────────".truecolor(60, 60, 80));
+            println!("  {:<25} {}", "Plan:".dimmed(), plan.plan_type.bold().truecolor(120, 200, 120));
+            if let Some(ref field) = plan.index_field {
+                println!("  {:<25} {} ({})", "Index:".dimmed(), field.cyan(), plan.index_type.as_deref().unwrap_or("?"));
+            }
+            if let Some(ref pred) = plan.predicate {
+                println!("  {:<25} {}", "Predicate:".dimmed(), pred);
+            }
+            println!("  {:<25} {}", "Residual filter:".dimmed(), if plan.has_residual { "yes" } else { "no" });
+            println!("  {:<25} {:.2}", "Selectivity:".dimmed(), plan.selectivity);
+            println!("  {:<25} {}", "Collection size:".dimmed(), plan.total_docs);
+            println!("  {:<25} {}", "Estimated scan:".dimmed(), plan.estimated_scan);
+            println!();
+        }
+        Err(e) => print_error(&e),
+    }
+}
 
 fn cmd_aggregate(shell: &Shell, parts: &[&str]) {
     if parts.len() < 3 {

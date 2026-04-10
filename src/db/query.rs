@@ -4,9 +4,27 @@ use super::aggregation;
 use super::database::{DatabaseManager, QueryOptions};
 use super::error::VantaError;
 use super::filter::matches_filter;
-use super::planner::{self, QueryPlan};
+use super::planner::{self, QueryExplanation, QueryPlan};
 
 impl DatabaseManager {
+    // ---- Explain plan ----------------------------------------
+
+    pub fn explain(
+        &self,
+        db: &str,
+        collection: &str,
+        filter: &Value,
+    ) -> Result<QueryExplanation, VantaError> {
+        self.require_db(db)?;
+        let store = self.db_engine(db)?;
+        let total_docs = store.count_latest(collection);
+
+        let idx_key = Self::idx_key(db, collection);
+        let indexes = self.index_manager.get_all_indexes(&idx_key);
+
+        Ok(planner::explain_query(filter, &indexes, total_docs))
+    }
+
     // ---- Rich query (filter) ---------------------------------
 
     pub fn query(
