@@ -1457,6 +1457,82 @@ pub async fn run(
     }).await;
 
     // ═══════════════════════════════════════════════
+    //  SECTION: Cluster (Phase 5)
+    // ═══════════════════════════════════════════════
+
+    section("Cluster");
+
+    runner.check("ClusterStatus", |mut auth, _, tok| async move {
+        let resp = auth
+            .cluster_status(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        // In single-node mode, should have at least one node
+        if resp.nodes.is_empty() {
+            return Err("ClusterStatus returned no nodes".into());
+        }
+        // The single node should be the leader
+        let has_leader = resp.nodes.iter().any(|n| n.role == "leader");
+        if !has_leader {
+            return Err("No leader found in ClusterStatus".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("ClusterStatus (node info)", |mut auth, _, tok| async move {
+        let resp = auth
+            .cluster_status(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        // Verify node info fields are populated
+        let node = &resp.nodes[0];
+        if node.addr.is_empty() {
+            return Err("Node addr is empty".into());
+        }
+        if node.role.is_empty() {
+            return Err("Node role is empty".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("Read consistency header (default=strong)", |_, mut db, tok| async move {
+        // A normal read without x-read-consistency header should work
+        // (defaults to strong, and in single-node mode the server is always the leader)
+        let resp = db
+            .find_all(auth_req(&tok, proto::FindAllRequest {
+                database: TEST_DB.to_string(),
+                collection: TEST_COL.to_string(),
+                pagination: None,
+                sort: None,
+            }))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Should succeed (single-node = leader)
+        let _ = resp.into_inner();
+        Ok(())
+    }).await;
+
+    runner.check("Read with lease consistency", |_, mut db, tok| async move {
+        // Send a read with x-read-consistency: lease header
+        let mut request = tonic::Request::new(proto::FindAllRequest {
+            database: TEST_DB.to_string(),
+            collection: TEST_COL.to_string(),
+            pagination: None,
+            sort: None,
+        });
+        let val: tonic::metadata::MetadataValue<_> = format!("Bearer {}", tok).parse().unwrap();
+        request.metadata_mut().insert("authorization", val);
+        let lease_val: tonic::metadata::MetadataValue<_> = "lease".parse().unwrap();
+        request.metadata_mut().insert("x-read-consistency", lease_val);
+
+        let resp = db.find_all(request).await.map_err(|e| e.to_string())?;
+        let _ = resp.into_inner();
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
     //  SECTION: Cleanup
     // ═══════════════════════════════════════════════
 
