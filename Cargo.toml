@@ -39,6 +39,7 @@ crc32c = "0.6"
 time = "0.3"
 jsonwebtoken = "9"
 toml = "0.8"
+rustyline = "14"
 tokio-stream = "0.1"
 
 [dev-dependencies]

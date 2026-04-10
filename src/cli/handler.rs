@@ -61,14 +61,34 @@ pub fn handle_command(shell: &mut Shell, input: &str) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Display a VantaError to the user with appropriate coloring.
+/// Display a VantaError to the user with appropriate coloring and hints.
 fn print_error(e: &VantaError) {
     match e {
-        VantaError::NotFound { .. } | VantaError::AlreadyExists { .. } => {
+        VantaError::NotFound { entity, .. } => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().yellow());
+            match *entity {
+                "Collection" => println!("  {} use \"show collections\" to list available collections", "hint:".dimmed()),
+                "Database" => println!("  {} use \"show dbs\" to list databases", "hint:".dimmed()),
+                _ => {}
+            }
+        }
+        VantaError::AlreadyExists { .. } => {
             println!("  {} {}", "✗".red().bold(), e.to_string().yellow());
         }
         VantaError::ValidationFailed { .. } => {
             println!("  {} {}", "✗".red().bold(), e.to_string().yellow());
+        }
+        VantaError::PermissionDenied { .. } => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().red());
+            println!("  {} check your role with \"whoami\"", "hint:".dimmed());
+        }
+        VantaError::TransactionConflict { .. } => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().red());
+            println!("  {} another transaction holds the lock, retry", "hint:".dimmed());
+        }
+        VantaError::Deadlock { .. } => {
+            println!("  {} {}", "✗".red().bold(), e.to_string().red());
+            println!("  {} deadlock detected, transaction aborted — retry with different ordering", "hint:".dimmed());
         }
         _ => {
             println!("  {} {}", "✗".red().bold(), e.to_string().red());
