@@ -4,7 +4,7 @@ use tonic::{Response, Status};
 
 use crate::auth::{AclManager, AuthManager, CertManager};
 use crate::db::{DatabaseManager, QueryOptions, VantaError};
-use crate::raft::{LeaderForwarder, RaftOp, RaftResponse, VantaRaft};
+use crate::raft::{LeaderForwarder, LeaseTracker, RaftOp, RaftResponse, VantaRaft};
 use super::auth_interceptor::AuthContext;
 use super::proto;
 use super::audit::AuditLogger;
@@ -38,6 +38,54 @@ pub struct VantaDbServiceImpl {
     pub metrics: Arc<MetricsCollector>,
     pub raft: Option<Arc<VantaRaft>>,
     pub forwarder: Option<Arc<LeaderForwarder>>,
+    pub lease: Option<Arc<LeaseTracker>>,
+}
+
+/// Check if this node can serve a read with the given consistency.
+/// Returns Ok(()) if the read can be served locally, Err(Status) if not.
+pub fn check_read_permission(
+    raft: &Option<Arc<VantaRaft>>,
+    lease: &Option<Arc<LeaseTracker>>,
+    consistency: crate::raft::ReadConsistency,
+) -> Result<(), Status> {
+    use crate::raft::ReadConsistency;
+
+    match raft {
+        None => Ok(()), // Single-node mode: always serve locally
+        Some(r) => {
+            let metrics = r.metrics().borrow().clone();
+            let is_leader = metrics.current_leader == metrics.id.into();
+
+            match consistency {
+                ReadConsistency::Strong => {
+                    if is_leader {
+                        Ok(())
+                    } else {
+                        let leader_hint = metrics.current_leader
+                            .map(|id| format!(" (leader_id={})", id))
+                            .unwrap_or_default();
+                        Err(Status::unavailable(format!(
+                            "Strong read requires leader{}",
+                            leader_hint
+                        )))
+                    }
+                }
+                ReadConsistency::Lease => {
+                    if is_leader {
+                        Ok(()) // Leader can always serve reads
+                    } else if let Some(ref l) = lease {
+                        if l.is_valid() {
+                            Ok(()) // Lease is valid, serve locally
+                        } else {
+                            Err(Status::unavailable("Read lease expired, retry on leader"))
+                        }
+                    } else {
+                        Err(Status::unavailable("No lease tracker available"))
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Propose a write through Raft if clustered, or execute directly if single-node.

@@ -90,6 +90,7 @@ pub async fn start(
         metrics: Arc::clone(&metrics),
         raft: None,
         forwarder: None,
+        lease: None,
     };
 
     let interceptor = AuthInterceptor {
