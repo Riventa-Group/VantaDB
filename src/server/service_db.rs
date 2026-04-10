@@ -635,6 +635,42 @@ impl proto::vanta_db_server::VantaDb for VantaDbServiceImpl {
         }
     }
 
+    // ---- Explain plan ------------------------------------------
+
+    async fn explain(
+        &self,
+        request: Request<proto::QueryRequest>,
+    ) -> Result<Response<proto::ExplainResponse>, Status> {
+        let ctx = extract_auth(&request)?;
+        let req = request.into_inner();
+        require_read(&self.acl_manager, &ctx, &req.database, Some(&req.collection))?;
+
+        let filter: serde_json::Value = serde_json::from_str(&req.filter_json)
+            .map_err(|e| Status::invalid_argument(format!("Invalid filter JSON: {}", e)))?;
+
+        let mgr = Arc::clone(&self.db_manager);
+        let db = req.database;
+        let col = req.collection;
+
+        let explanation = tokio::task::spawn_blocking(move || mgr.explain(&db, &col, &filter))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(vanta_err)?;
+
+        Ok(Response::new(proto::ExplainResponse {
+            plan_type: explanation.plan_type,
+            index_field: explanation.index_field.unwrap_or_default(),
+            index_type: explanation.index_type.unwrap_or_default(),
+            predicate: explanation.predicate.unwrap_or_default(),
+            has_residual: explanation.has_residual,
+            selectivity: explanation.selectivity,
+            total_docs: explanation.total_docs as u64,
+            estimated_scan: explanation.estimated_scan as u64,
+        }))
+    }
+
+    // ---- Change feeds -------------------------------------------
+
     async fn watch_collection(
         &self,
         request: Request<proto::WatchRequest>,

@@ -91,6 +91,9 @@ service VantaDb {
 
   // Change feeds
   rpc WatchCollection (WatchRequest) returns (stream WatchEvent);
+
+  // Explain plan
+  rpc Explain (QueryRequest) returns (ExplainResponse);
 }
 
 // ─── Common ──────────────────────────────────
@@ -538,4 +541,17 @@ message WatchEvent {
   string doc_id        = 3;
   string document_json = 4;  // empty for deletes
   string timestamp     = 5;
+}
+
+// ─── Explain messages ────────────────────────
+
+message ExplainResponse {
+  string plan_type      = 1;  // "FullScan" or "IndexScan"
+  string index_field    = 2;
+  string index_type     = 3;  // "BTree" or "Hash"
+  string predicate      = 4;  // e.g. "age $gt 25"
+  bool   has_residual   = 5;
+  double selectivity    = 6;
+  uint64 total_docs     = 7;
+  uint64 estimated_scan = 8;
 }

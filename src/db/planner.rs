@@ -71,6 +71,103 @@ pub fn plan_query(filter: &Value, available_indexes: &[Arc<dyn Index>]) -> Query
     }
 }
 
+/// Explanation of a query plan for EXPLAIN output.
+#[derive(Debug, Clone)]
+pub struct QueryExplanation {
+    pub plan_type: String,
+    pub index_field: Option<String>,
+    pub index_type: Option<String>,
+    pub predicate: Option<String>,
+    pub has_residual: bool,
+    pub selectivity: f64,
+    pub total_docs: usize,
+    pub estimated_scan: usize,
+}
+
+/// Explain a query without executing it.
+pub fn explain_query(
+    filter: &Value,
+    available_indexes: &[Arc<dyn Index>],
+    total_docs: usize,
+) -> QueryExplanation {
+    if available_indexes.is_empty() {
+        return QueryExplanation {
+            plan_type: "FullScan".to_string(),
+            index_field: None,
+            index_type: None,
+            predicate: None,
+            has_residual: false,
+            selectivity: 1.0,
+            total_docs,
+            estimated_scan: total_docs,
+        };
+    }
+
+    let predicates = extract_predicates(filter);
+    if predicates.is_empty() {
+        return QueryExplanation {
+            plan_type: "FullScan".to_string(),
+            index_field: None,
+            index_type: None,
+            predicate: None,
+            has_residual: false,
+            selectivity: 1.0,
+            total_docs,
+            estimated_scan: total_docs,
+        };
+    }
+
+    let mut best: Option<(Predicate, Arc<dyn Index>, u32)> = None;
+
+    for pred in &predicates {
+        for idx in available_indexes {
+            if idx.field() == pred.field && idx.supports_op(&pred.op) {
+                let sel = estimate_selectivity(pred);
+                let is_better = match &best {
+                    None => true,
+                    Some((_, _, current)) => sel < *current,
+                };
+                if is_better {
+                    best = Some((pred.clone(), Arc::clone(idx), sel));
+                }
+            }
+        }
+    }
+
+    match best {
+        None => QueryExplanation {
+            plan_type: "FullScan".to_string(),
+            index_field: None,
+            index_type: None,
+            predicate: None,
+            has_residual: false,
+            selectivity: 1.0,
+            total_docs,
+            estimated_scan: total_docs,
+        },
+        Some((pred, idx, sel_score)) => {
+            let residual = build_residual_filter(filter, &pred);
+            let selectivity = match sel_score {
+                1 => 0.05,   // eq: ~5%
+                2 => 0.15,   // in: ~15%
+                5 => 0.33,   // range: ~33%
+                _ => 0.5,
+            };
+            let estimated = (total_docs as f64 * selectivity).ceil() as usize;
+            QueryExplanation {
+                plan_type: "IndexScan".to_string(),
+                index_field: Some(idx.field().to_string()),
+                index_type: Some(format!("{:?}", idx.index_type())),
+                predicate: Some(format!("{} {} {}", pred.field, pred.op, pred.value)),
+                has_residual: residual.is_some(),
+                selectivity,
+                total_docs,
+                estimated_scan: estimated.max(1),
+            }
+        }
+    }
+}
+
 /// Execute an index scan for a predicate, returning candidate document IDs.
 pub fn execute_index_scan(index: &dyn Index, predicate: &Predicate) -> Vec<String> {
     match predicate.op.as_str() {
@@ -418,5 +515,26 @@ mod tests {
         assert_eq!(preds.len(), 2);
         assert!(preds.iter().any(|p| p.field == "name" && p.op == "$eq"));
         assert!(preds.iter().any(|p| p.field == "age" && p.op == "$gt"));
+    }
+
+    #[test]
+    fn test_explain_with_index() {
+        let indexes = vec![make_btree_index("age")];
+        let filter = json!({"age": {"$gt": 25}});
+        let explanation = explain_query(&filter, &indexes, 1000);
+        assert_eq!(explanation.plan_type, "IndexScan");
+        assert_eq!(explanation.index_field.as_deref(), Some("age"));
+        assert!(explanation.selectivity < 1.0);
+        assert!(explanation.estimated_scan < 1000);
+    }
+
+    #[test]
+    fn test_explain_full_scan() {
+        let filter = json!({"name": "Alice"});
+        let explanation = explain_query(&filter, &[], 500);
+        assert_eq!(explanation.plan_type, "FullScan");
+        assert_eq!(explanation.index_field, None);
+        assert_eq!(explanation.selectivity, 1.0);
+        assert_eq!(explanation.estimated_scan, 500);
     }
 }
