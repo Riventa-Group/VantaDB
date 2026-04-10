@@ -41,6 +41,12 @@ pub fn handle_command(shell: &mut Shell, input: &str) -> io::Result<bool> {
         "passwd" => cmd_passwd(shell, &parts),
         "status" => cmd_status(shell),
         "benchmark" | "bench" => cmd_benchmark(),
+        "acl" => super::cmd_security::cmd_acl(shell, &parts),
+        "certs" => super::cmd_security::cmd_certs(shell, &parts),
+        "audit" => super::cmd_ops::cmd_audit(shell, &parts),
+        "metrics" => super::cmd_ops::cmd_metrics(shell),
+        "health" => super::cmd_ops::cmd_health(shell),
+        "backup" => super::cmd_ops::cmd_backup(shell, &parts),
         _ => {
             println!(
                 "  {} Unknown command: {}. Type {} for help.",
@@ -171,6 +177,29 @@ fn cmd_help(_shell: &Shell) {
                 ("rmuser <name>", "Delete a user"),
                 ("passwd <name>", "Change password"),
                 ("whoami", "Show current user"),
+            ],
+        ),
+        (
+            "Security",
+            vec![
+                ("acl set <u> <db> [col] <perm>", "Set ACL permission"),
+                ("acl get <user>", "Show user ACLs"),
+                ("acl delete <user>", "Remove all ACLs"),
+                ("certs issue <user>", "Issue client certificate"),
+                ("certs revoke <serial>", "Revoke certificate"),
+                ("certs list", "List all certificates"),
+                ("certs ca", "Print CA certificate"),
+            ],
+        ),
+        (
+            "Operations",
+            vec![
+                ("audit [--user X --op Y]", "Query audit log"),
+                ("metrics", "Show server metrics"),
+                ("health", "Show health status"),
+                ("backup", "Create a backup"),
+                ("backup list", "List backups"),
+                ("backup restore <path>", "Restore from backup"),
             ],
         ),
         (
