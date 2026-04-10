@@ -1,5 +1,6 @@
 pub mod forwarder;
 pub mod lease;
+pub mod membership;
 pub mod network;
 pub mod proto_service;
 pub mod state_machine;
@@ -8,6 +9,7 @@ pub mod types;
 
 pub use forwarder::LeaderForwarder;
 pub use lease::{LeaseTracker, ReadConsistency};
+pub use membership::ClusterMembership;
 pub use network::VantaNetworkFactory;
 pub use proto_service::VantaRaftService;
 pub use state_machine::VantaStateMachine;

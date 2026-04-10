@@ -140,3 +140,18 @@ pub fn cmd_backup(shell: &mut Shell, parts: &[&str]) {
         println!("  {} Usage: backup [create|list|restore <path>]", "✗".red().bold());
     }
 }
+
+pub fn cmd_cluster(shell: &mut Shell) {
+    if !shell.user.role.can_admin() {
+        println!("  {} Admin role required", "✗".red().bold());
+        return;
+    }
+
+    // In CLI mode (direct access), show single-node info
+    let db_count = shell.db_manager.list_databases().len();
+    println!("  {}", "CLUSTER STATUS".bold().truecolor(120, 80, 255));
+    println!("    {:<20} {}", "Mode:".dimmed(), "single-node");
+    println!("    {:<20} {}", "Role:".dimmed(), "leader".green());
+    println!("    {:<20} {}", "Databases:".dimmed(), db_count);
+    println!("    {:<20} {}", "Active tx:".dimmed(), shell.metrics.gauge("active_transactions"));
+}

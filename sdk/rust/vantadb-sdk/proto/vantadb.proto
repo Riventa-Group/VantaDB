@@ -5,13 +5,42 @@ package vantadb;
 // Internal cluster communication — not for client use.
 
 service VantaRaft {
-  rpc AppendEntries  (RaftMessage) returns (RaftMessage);
-  rpc InstallSnapshot (RaftMessage) returns (RaftMessage);
-  rpc Vote           (RaftMessage) returns (RaftMessage);
+  rpc AppendEntries   (RaftMessage)    returns (RaftMessage);
+  rpc InstallSnapshot (RaftMessage)    returns (RaftMessage);
+  rpc Vote            (RaftMessage)    returns (RaftMessage);
+  rpc JoinCluster     (JoinRequest)    returns (JoinResponse);
+  rpc LeaveCluster    (LeaveRequest)   returns (StatusResponse);
 }
 
 message RaftMessage {
   bytes data = 1;
+}
+
+message JoinRequest {
+  uint64 node_id        = 1;
+  string advertise_addr = 2;
+}
+
+message JoinResponse {
+  bool   success     = 1;
+  string error       = 2;
+  uint64 leader_id   = 3;
+  string leader_addr = 4;
+}
+
+message LeaveRequest {
+  uint64 node_id = 1;
+}
+
+message ClusterStatusResponse {
+  repeated ClusterNodeInfo nodes = 1;
+  uint64 leader_id               = 2;
+}
+
+message ClusterNodeInfo {
+  uint64 node_id = 1;
+  string addr    = 2;
+  string role    = 3;  // "leader", "follower", "learner", "unknown"
 }
 
 // ─── Authentication Service ──────────────────
@@ -49,6 +78,9 @@ service VantaAuth {
   rpc CreateBackup  (Empty)          returns (BackupResponse);
   rpc ListBackups   (Empty)          returns (ListBackupsResponse);
   rpc RestoreBackup (RestoreRequest) returns (StatusResponse);
+
+  // Cluster
+  rpc ClusterStatus (Empty)          returns (ClusterStatusResponse);
 }
 
 // ─── Database Service ────────────────────────
