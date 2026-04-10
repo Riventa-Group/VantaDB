@@ -1,3 +1,4 @@
+pub mod record;
 pub mod engine;
 pub mod mvcc;
 pub use engine::{ReadSnapshot, StorageEngine, Table};
