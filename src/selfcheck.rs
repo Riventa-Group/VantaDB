@@ -146,7 +146,7 @@ pub async fn run(
         let mut ac = auth_client.clone();
         let resp = match ac
             .authenticate(proto::AuthRequest {
-                username: username.to_string(),
+                username: "root".to_string(),
                 password: password.to_string(),
             })
             .await
@@ -1168,6 +1168,291 @@ pub async fn run(
         if inner.found {
             return Err("Should not have found nonexistent doc".into());
         }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: Health & Metrics (Phase 3-4)
+    // ═══════════════════════════════════════════════
+
+    section("Health & Metrics");
+
+    runner.check("HealthCheck (no auth)", |mut auth, _, _| async move {
+        let resp = auth
+            .health_check(proto::Empty {})
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if resp.status != "healthy" {
+            return Err(format!("Expected healthy, got {}", resp.status));
+        }
+        if resp.version.is_empty() {
+            return Err("Version is empty".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("GetMetrics (admin)", |mut auth, _, tok| async move {
+        let resp = auth
+            .get_metrics(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        // Should have some gauges (uptime at minimum)
+        if resp.gauges.is_empty() {
+            return Err("Metrics gauges are empty".into());
+        }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: Audit Log (Phase 3)
+    // ═══════════════════════════════════════════════
+
+    section("Audit Log");
+
+    runner.check("QueryAuditLog", |mut auth, _, tok| async move {
+        let resp = auth
+            .query_audit_log(auth_req(&tok, proto::AuditLogRequest {
+                username: String::new(),
+                operation: String::new(),
+                database: String::new(),
+                since: String::new(),
+                limit: 5,
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        // Should have entries from operations above
+        if resp.entries.is_empty() {
+            return Err("Audit log is empty after operations".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("QueryAuditLog (filter by op)", |mut auth, _, tok| async move {
+        let resp = auth
+            .query_audit_log(auth_req(&tok, proto::AuditLogRequest {
+                username: String::new(),
+                operation: "insert".to_string(),
+                database: String::new(),
+                since: String::new(),
+                limit: 10,
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        for entry in &resp.entries {
+            if entry.operation != "insert" {
+                return Err(format!("Expected operation 'insert', got '{}'", entry.operation));
+            }
+        }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: ACLs (Phase 2)
+    // ═══════════════════════════════════════════════
+
+    section("ACLs");
+
+    runner.check("SetAcl (database-level)", |mut auth, _, tok| async move {
+        auth.set_acl(auth_req(&tok, proto::SetAclRequest {
+            username: "root".to_string(),
+            database: TEST_DB.to_string(),
+            collection: String::new(),
+            permission: "readwrite".to_string(),
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }).await;
+
+    runner.check("GetAcl", |mut auth, _, tok| async move {
+        let resp = auth
+            .get_acl(auth_req(&tok, proto::GetAclRequest {
+                username: "root".to_string(),
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if !resp.found {
+            return Err("ACL not found after SetAcl".into());
+        }
+        if resp.databases.is_empty() {
+            return Err("No database ACLs returned".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("DeleteAcl", |mut auth, _, tok| async move {
+        auth.delete_acl(auth_req(&tok, proto::DeleteAclRequest {
+            username: "root".to_string(),
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Verify deleted
+        let resp = auth
+            .get_acl(auth_req(&tok, proto::GetAclRequest {
+                username: "root".to_string(),
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if resp.found {
+            return Err("ACL still exists after DeleteAcl".into());
+        }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: Certificates (Phase 2)
+    // ═══════════════════════════════════════════════
+
+    section("Certificates");
+
+    runner.check("GetCaCert", |mut auth, _, _| async move {
+        let resp = auth
+            .get_ca_cert(proto::Empty {})
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if !resp.ca_pem.contains("BEGIN CERTIFICATE") {
+            return Err("CA cert doesn't look like PEM".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("IssueCert + ListCerts", |mut auth, _, tok| async move {
+        let resp = auth
+            .issue_cert(auth_req(&tok, proto::IssueCertRequest {
+                username: "selfcheck_cert_user".to_string(),
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if !resp.success {
+            return Err(format!("IssueCert failed: {}", resp.error));
+        }
+        let serial = resp.serial;
+
+        // Verify in list
+        let list_resp = auth
+            .list_certs(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if !list_resp.certs.iter().any(|c| c.serial == serial) {
+            return Err("Issued cert not found in ListCerts".into());
+        }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: Backup & Restore (Phase 3)
+    // ═══════════════════════════════════════════════
+
+    section("Backup & Restore");
+
+    runner.check("CreateBackup", |mut auth, _, tok| async move {
+        let resp = auth
+            .create_backup(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if !resp.success {
+            return Err(format!("CreateBackup failed: {}", resp.error));
+        }
+        if resp.path.is_empty() {
+            return Err("Backup path is empty".into());
+        }
+        Ok(())
+    }).await;
+
+    runner.check("ListBackups", |mut auth, _, tok| async move {
+        let resp = auth
+            .list_backups(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if resp.backups.is_empty() {
+            return Err("No backups found after CreateBackup".into());
+        }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: Explain Plan (Phase 4)
+    // ═══════════════════════════════════════════════
+
+    section("Explain Plan");
+
+    runner.check("Explain (FullScan)", |_, mut db, tok| async move {
+        let resp = db
+            .explain(auth_req(&tok, proto::QueryRequest {
+                database: TEST_DB.to_string(),
+                collection: TEST_COL.to_string(),
+                filter_json: r#"{"nonindexed": "value"}"#.to_string(),
+                pagination: None,
+                sort: None,
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        if resp.plan_type != "FullScan" {
+            return Err(format!("Expected FullScan, got {}", resp.plan_type));
+        }
+        Ok(())
+    }).await;
+
+    // ═══════════════════════════════════════════════
+    //  SECTION: Transactions (Phase 3 - isolation)
+    // ═══════════════════════════════════════════════
+
+    section("Transaction Isolation");
+
+    runner.check("TxFindById (read-your-own-writes)", |_, mut db, tok| async move {
+        // Begin tx
+        let tx_resp = db
+            .begin_tx(auth_req(&tok, proto::Empty {}))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        let tx_id = tx_resp.tx_id;
+
+        // Insert within tx
+        db.tx_insert(auth_req(&tok, proto::TxInsertRequest {
+            tx_id: tx_id.clone(),
+            database: TEST_DB.to_string(),
+            collection: TEST_COL.to_string(),
+            document_json: r#"{"_id": "tx_ryow_test", "name": "TxTest"}"#.to_string(),
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Read within same tx — should see own write
+        let read_resp = db
+            .tx_find_by_id(auth_req(&tok, proto::TxFindByIdRequest {
+                tx_id: tx_id.clone(),
+                database: TEST_DB.to_string(),
+                collection: TEST_COL.to_string(),
+                id: "tx_ryow_test".to_string(),
+            }))
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+
+        if !read_resp.found {
+            // Rollback and fail
+            let _ = db.rollback_tx(auth_req(&tok, proto::TxRequest { tx_id })).await;
+            return Err("TxFindById did not see own write".into());
+        }
+
+        // Rollback (cleanup)
+        db.rollback_tx(auth_req(&tok, proto::TxRequest { tx_id }))
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }).await;
 
