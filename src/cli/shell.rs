@@ -5,18 +5,24 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 
-use crate::auth::{AuthManager, Role, User};
+use crate::auth::{AclManager, AuthManager, CertManager, Role, User};
 use crate::cli::handler;
 use crate::db::DatabaseManager;
+use crate::server::audit::AuditLogger;
+use crate::server::metrics::MetricsCollector;
 use crate::storage::StorageEngine;
 
 pub struct Shell {
     pub user: User,
     pub auth: AuthManager,
     pub db_manager: DatabaseManager,
+    pub acl_manager: AclManager,
+    pub cert_manager: CertManager,
+    pub audit_logger: AuditLogger,
+    pub metrics: MetricsCollector,
     pub current_db: Option<String>,
     pub current_tx: Option<String>,
-    _data_dir: PathBuf,
+    pub data_dir: PathBuf,
 }
 
 impl Shell {
@@ -57,13 +63,17 @@ impl Shell {
         new_path
     }
 
-    pub fn init() -> io::Result<(StorageEngine, AuthManager, DatabaseManager)> {
+    pub fn init() -> io::Result<(StorageEngine, AuthManager, DatabaseManager, AclManager, CertManager, AuditLogger)> {
         let data_dir = Self::data_dir();
-        let engine = StorageEngine::open(&data_dir.join("system"))?;
-        let auth = AuthManager::new(engine)?;
+        let engine = std::sync::Arc::new(StorageEngine::open(&data_dir.join("system"))?);
+        let auth = AuthManager::new(StorageEngine::open(&data_dir.join("system"))?)?;
         let db_manager = DatabaseManager::new(&data_dir.join("data"))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        Ok((StorageEngine::open(&data_dir.join("system"))?, auth, db_manager))
+        let acl_manager = AclManager::new(std::sync::Arc::clone(&engine))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let cert_manager = CertManager::bootstrap(&data_dir, std::sync::Arc::clone(&engine))?;
+        let audit_logger = AuditLogger::new(std::sync::Arc::clone(&engine))?;
+        Ok((StorageEngine::open(&data_dir.join("system"))?, auth, db_manager, acl_manager, cert_manager, audit_logger))
     }
 
     pub fn print_banner() {
@@ -147,14 +157,25 @@ impl Shell {
         }
     }
 
-    pub fn new(user: User, auth: AuthManager, db_manager: DatabaseManager) -> Self {
+    pub fn new(
+        user: User,
+        auth: AuthManager,
+        db_manager: DatabaseManager,
+        acl_manager: AclManager,
+        cert_manager: CertManager,
+        audit_logger: AuditLogger,
+    ) -> Self {
         Self {
             user,
             auth,
             db_manager,
+            acl_manager,
+            cert_manager,
+            audit_logger,
+            metrics: MetricsCollector::new(),
             current_db: None,
             current_tx: None,
-            _data_dir: Self::data_dir(),
+            data_dir: Self::data_dir(),
         }
     }
 

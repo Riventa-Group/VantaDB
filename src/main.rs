@@ -116,7 +116,7 @@ fn main() {
 fn run_login() {
     Shell::print_banner();
 
-    let (_engine, auth, db_manager) = match Shell::init() {
+    let (_engine, auth, db_manager, acl_manager, cert_manager, audit_logger) = match Shell::init() {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
@@ -143,7 +143,7 @@ fn run_login() {
         }
     };
 
-    let mut shell = Shell::new(user, auth, db_manager);
+    let mut shell = Shell::new(user, auth, db_manager, acl_manager, cert_manager, audit_logger);
     if let Err(e) = shell.run() {
         eprintln!(
             "  {} Shell error: {}",
@@ -157,7 +157,7 @@ fn run_login() {
 fn run_status() {
     Shell::print_banner();
 
-    let (_engine, auth, db_manager) = match Shell::init() {
+    let (_engine, auth, db_manager, _acl, _cert, _audit) = match Shell::init() {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
@@ -209,7 +209,7 @@ fn run_status() {
 fn run_server(cfg: &config::Config) {
     Shell::print_banner();
 
-    let (engine, auth, db_manager) = match Shell::init() {
+    let (engine, auth, db_manager, _acl, _cert, _audit) = match Shell::init() {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
