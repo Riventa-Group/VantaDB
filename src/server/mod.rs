@@ -88,7 +88,8 @@ pub async fn start(
         acl_manager: Arc::clone(&acl_manager),
         audit_logger: Arc::clone(&audit_logger),
         metrics: Arc::clone(&metrics),
-        raft: None, // Set to Some(raft) when cluster mode is enabled
+        raft: None,
+        forwarder: None,
     };
 
     let interceptor = AuthInterceptor {

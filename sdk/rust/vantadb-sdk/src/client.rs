@@ -24,6 +24,9 @@ pub struct VantaClient {
     auth: VantaAuthClient<Channel>,
     db: VantaDbClient<Channel>,
     token: Option<String>,
+    /// Additional cluster addresses for retry on UNAVAILABLE.
+    cluster_addrs: Vec<String>,
+    current_addr_idx: usize,
 }
 
 impl VantaClient {
@@ -36,7 +39,42 @@ impl VantaClient {
             auth: VantaAuthClient::new(channel.clone()),
             db: VantaDbClient::new(channel),
             token: None,
+            cluster_addrs: vec![addr.to_string()],
+            current_addr_idx: 0,
         })
+    }
+
+    /// Connect to a VantaDB cluster. Accepts multiple node addresses.
+    /// On UNAVAILABLE errors, the client retries on the next address.
+    pub async fn connect_cluster(addrs: &[&str]) -> Result<Self, Box<dyn std::error::Error>> {
+        for addr in addrs {
+            match Channel::from_shared(addr.to_string())?.connect().await {
+                Ok(channel) => {
+                    return Ok(Self {
+                        auth: VantaAuthClient::new(channel.clone()),
+                        db: VantaDbClient::new(channel),
+                        token: None,
+                        cluster_addrs: addrs.iter().map(|a| a.to_string()).collect(),
+                        current_addr_idx: 0,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+        Err("Could not connect to any cluster node".into())
+    }
+
+    /// Reconnect to the next node in the cluster (for retry on UNAVAILABLE).
+    pub async fn reconnect_next(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.cluster_addrs.len() <= 1 {
+            return Err("No other nodes to try".into());
+        }
+        self.current_addr_idx = (self.current_addr_idx + 1) % self.cluster_addrs.len();
+        let addr = &self.cluster_addrs[self.current_addr_idx];
+        let channel = Channel::from_shared(addr.clone())?.connect().await?;
+        self.auth = VantaAuthClient::new(channel.clone());
+        self.db = VantaDbClient::new(channel);
+        Ok(())
     }
 
     /// Connect with mTLS (client certificate + CA verification).
@@ -60,6 +98,8 @@ impl VantaClient {
             auth: VantaAuthClient::new(channel.clone()),
             db: VantaDbClient::new(channel),
             token: None,
+            cluster_addrs: vec![addr.to_string()],
+            current_addr_idx: 0,
         })
     }
 
