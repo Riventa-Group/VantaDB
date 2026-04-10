@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "sdk/rust/vantadb-sdk"]
+
 [package]
 name = "vantadb"
 version = "1.0.0"

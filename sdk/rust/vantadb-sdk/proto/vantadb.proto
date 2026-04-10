@@ -1,0 +1,557 @@
+syntax = "proto3";
+package vantadb;
+
+// ─── Authentication Service ──────────────────
+// Authenticate is callable without a token.
+// All other RPCs require a valid session token in the
+// "authorization" metadata key (Bearer <token>).
+
+service VantaAuth {
+  rpc Authenticate (AuthRequest)       returns (AuthResponse);
+  rpc CreateUser   (CreateUserRequest) returns (StatusResponse);
+  rpc DeleteUser   (DeleteUserRequest) returns (StatusResponse);
+  rpc SetPassword  (SetPasswordRequest) returns (StatusResponse);
+  rpc ListUsers    (Empty)             returns (ListUsersResponse);
+  rpc GetUser      (GetUserRequest)    returns (GetUserResponse);
+
+  // Certificate management (mTLS)
+  rpc IssueCert    (IssueCertRequest)  returns (IssueCertResponse);
+  rpc RevokeCert   (RevokeCertRequest) returns (StatusResponse);
+  rpc ListCerts    (Empty)             returns (ListCertsResponse);
+  rpc GetCaCert    (Empty)             returns (CaCertResponse);
+
+  // ACL management
+  rpc SetAcl       (SetAclRequest)     returns (StatusResponse);
+  rpc GetAcl       (GetAclRequest)     returns (GetAclResponse);
+  rpc DeleteAcl    (DeleteAclRequest)  returns (StatusResponse);
+
+  // Audit log
+  rpc QueryAuditLog (AuditLogRequest)  returns (AuditLogResponse);
+
+  // Metrics & health
+  rpc GetMetrics  (Empty)  returns (MetricsResponse);
+  rpc HealthCheck (Empty)  returns (HealthResponse);
+
+  // Backup & restore
+  rpc CreateBackup  (Empty)          returns (BackupResponse);
+  rpc ListBackups   (Empty)          returns (ListBackupsResponse);
+  rpc RestoreBackup (RestoreRequest) returns (StatusResponse);
+}
+
+// ─── Database Service ────────────────────────
+// All RPCs require a valid session token.
+
+service VantaDb {
+  // Database operations
+  rpc CreateDatabase   (DatabaseRequest)   returns (StatusResponse);
+  rpc DropDatabase     (DatabaseRequest)   returns (StatusResponse);
+  rpc ListDatabases    (Empty)             returns (ListDatabasesResponse);
+
+  // Collection operations
+  rpc CreateCollection (CollectionRequest) returns (StatusResponse);
+  rpc DropCollection   (CollectionRequest) returns (StatusResponse);
+  rpc ListCollections  (DatabaseRequest)   returns (ListCollectionsResponse);
+
+  // Document CRUD
+  rpc Insert     (InsertRequest)     returns (InsertResponse);
+  rpc FindById   (FindByIdRequest)   returns (DocumentResponse);
+  rpc FindAll    (FindAllRequest)    returns (DocumentsResponse);
+  rpc FindWhere  (FindWhereRequest)  returns (DocumentsResponse);
+  rpc DeleteById (DeleteByIdRequest) returns (DeleteResponse);
+  rpc Count      (CountRequest)      returns (CountResponse);
+
+  // Update operations
+  rpc Update      (UpdateRequest)      returns (UpdateResponse);
+  rpc UpdateWhere (UpdateWhereRequest)  returns (UpdateResponse);
+
+  // Rich query (filter engine)
+  rpc Query (QueryRequest) returns (DocumentsResponse);
+
+  // Aggregation pipeline
+  rpc Aggregate (AggregateRequest) returns (AggregateResponse);
+
+  // Index management
+  rpc CreateIndex (IndexRequest)      returns (StatusResponse);
+  rpc DropIndex   (IndexRequest)      returns (StatusResponse);
+  rpc ListIndexes (ListIndexesRequest) returns (ListIndexesResponse);
+
+  // Schema validation
+  rpc SetSchema  (SetSchemaRequest)  returns (StatusResponse);
+  rpc GetSchema  (GetSchemaRequest)  returns (GetSchemaResponse);
+  rpc DropSchema (GetSchemaRequest)  returns (StatusResponse);
+
+  // Transactions
+  rpc BeginTx    (Empty)            returns (TxResponse);
+  rpc CommitTx   (TxRequest)        returns (StatusResponse);
+  rpc RollbackTx (TxRequest)        returns (StatusResponse);
+  rpc TxInsert   (TxInsertRequest)  returns (StatusResponse);
+  rpc TxUpdate   (TxUpdateRequest)  returns (StatusResponse);
+  rpc TxDelete   (TxDeleteRequest)  returns (StatusResponse);
+  rpc TxFindById (TxFindByIdRequest) returns (DocumentResponse);
+
+  // Change feeds
+  rpc WatchCollection (WatchRequest) returns (stream WatchEvent);
+
+  // Explain plan
+  rpc Explain (QueryRequest) returns (ExplainResponse);
+}
+
+// ─── Common ──────────────────────────────────
+
+message Empty {}
+
+message StatusResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ─── Auth messages ───────────────────────────
+
+message AuthRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthResponse {
+  bool   success = 1;
+  string token   = 2;
+  string role    = 3;
+  string error   = 4;
+}
+
+message CreateUserRequest {
+  string          username  = 1;
+  string          password  = 2;
+  string          role      = 3;
+  repeated string databases = 4;
+}
+
+message DeleteUserRequest {
+  string username = 1;
+}
+
+message SetPasswordRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message GetUserRequest {
+  string username = 1;
+}
+
+message GetUserResponse {
+  bool            found      = 1;
+  string          username   = 2;
+  string          role       = 3;
+  string          created_at = 4;
+  repeated string databases  = 5;
+}
+
+message ListUsersResponse {
+  repeated string usernames = 1;
+}
+
+// ─── Certificate messages ────────────────────
+
+message IssueCertRequest {
+  string username = 1;
+}
+
+message IssueCertResponse {
+  bool   success  = 1;
+  string cert_pem = 2;
+  string key_pem  = 3;
+  string ca_pem   = 4;
+  string serial   = 5;
+  string error    = 6;
+}
+
+message RevokeCertRequest {
+  string serial = 1;
+}
+
+message ListCertsResponse {
+  repeated CertInfoMsg certs = 1;
+}
+
+message CertInfoMsg {
+  string serial    = 1;
+  string username  = 2;
+  string issued_at = 3;
+  bool   revoked   = 4;
+}
+
+message CaCertResponse {
+  string ca_pem = 1;
+}
+
+// ─── ACL messages ────────────────────────────
+
+message SetAclRequest {
+  string username   = 1;
+  string database   = 2;
+  string collection = 3;  // empty = database-level ACL
+  string permission = 4;  // "none", "readonly", "readwrite", "admin"
+}
+
+message GetAclRequest {
+  string username = 1;
+}
+
+message GetAclResponse {
+  bool                found     = 1;
+  repeated DatabaseAclMsg databases = 2;
+}
+
+message DatabaseAclMsg {
+  string                    database    = 1;
+  string                    permission  = 2;
+  repeated CollectionAclMsg collections = 3;
+}
+
+message CollectionAclMsg {
+  string collection = 1;
+  string permission = 2;
+}
+
+message DeleteAclRequest {
+  string username = 1;
+}
+
+// ─── Audit log messages ──────────────────────
+
+message AuditLogRequest {
+  string username  = 1;  // filter by username (empty = all)
+  string operation = 2;  // filter by operation (empty = all)
+  string database  = 3;  // filter by database (empty = all)
+  string since     = 4;  // ISO 8601 timestamp (empty = all time)
+  uint32 limit     = 5;  // max results (0 = default 100)
+}
+
+message AuditLogResponse {
+  repeated AuditEntry entries = 1;
+}
+
+message AuditEntry {
+  string id         = 1;
+  string timestamp  = 2;
+  string username   = 3;
+  string role       = 4;
+  string operation  = 5;
+  string database   = 6;
+  string collection = 7;
+  string detail     = 8;
+  bool   success    = 9;
+  string error      = 10;
+}
+
+// ─── Metrics & health messages ───────────────
+
+message MetricsResponse {
+  repeated MetricEntry counters   = 1;
+  repeated MetricEntry gauges     = 2;
+  repeated LatencyEntry latencies = 3;
+}
+
+message MetricEntry {
+  string name  = 1;
+  uint64 value = 2;
+}
+
+message LatencyEntry {
+  string operation = 1;
+  uint64 p50_us    = 2;
+  uint64 p95_us    = 3;
+  uint64 p99_us    = 4;
+}
+
+message HealthResponse {
+  string status              = 1;  // "healthy", "degraded", "unhealthy"
+  uint64 uptime_seconds      = 2;
+  uint64 database_count      = 3;
+  uint64 active_transactions = 4;
+  string version             = 5;
+}
+
+// ─── Backup & restore messages ───────────────
+
+message BackupResponse {
+  bool   success        = 1;
+  string path           = 2;
+  uint64 size_bytes     = 3;
+  uint64 database_count = 4;
+  uint64 document_count = 5;
+  string timestamp      = 6;
+  string error          = 7;
+}
+
+message ListBackupsResponse {
+  repeated BackupInfoMsg backups = 1;
+}
+
+message BackupInfoMsg {
+  string path       = 1;
+  uint64 size_bytes = 2;
+  string timestamp  = 3;
+}
+
+message RestoreRequest {
+  string path = 1;
+}
+
+// ─── Database messages ───────────────────────
+
+message DatabaseRequest {
+  string database = 1;
+}
+
+message ListDatabasesResponse {
+  repeated string databases = 1;
+}
+
+// ─── Collection messages ─────────────────────
+
+message CollectionRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message ListCollectionsResponse {
+  repeated string collections = 1;
+}
+
+// ─── Query options ───────────────────────────
+
+message PaginationOptions {
+  uint32 page      = 1;  // 1-indexed page number (0 = no pagination)
+  uint32 page_size = 2;  // items per page (default 50)
+}
+
+message SortOptions {
+  string field      = 1;  // field name to sort by
+  bool   descending = 2;  // true = descending, false = ascending
+}
+
+// ─── Document messages ───────────────────────
+
+message InsertRequest {
+  string database      = 1;
+  string collection    = 2;
+  string document_json = 3;
+}
+
+message InsertResponse {
+  bool   success = 1;
+  string id      = 2;
+  string error   = 3;
+}
+
+message FindByIdRequest {
+  string database   = 1;
+  string collection = 2;
+  string id         = 3;
+}
+
+message DocumentResponse {
+  bool   found         = 1;
+  string document_json = 2;
+  string error         = 3;
+}
+
+message FindAllRequest {
+  string database              = 1;
+  string collection            = 2;
+  PaginationOptions pagination = 3;
+  SortOptions       sort       = 4;
+}
+
+message FindWhereRequest {
+  string database              = 1;
+  string collection            = 2;
+  string field                 = 3;
+  string value_json            = 4;
+  PaginationOptions pagination = 5;
+  SortOptions       sort       = 6;
+}
+
+message DocumentsResponse {
+  repeated string documents_json = 1;
+  string          error          = 2;
+  uint64          total_count    = 3;
+}
+
+message DeleteByIdRequest {
+  string database   = 1;
+  string collection = 2;
+  string id         = 3;
+}
+
+message DeleteResponse {
+  bool   success = 1;
+  bool   found   = 2;
+  string error   = 3;
+}
+
+message CountRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message CountResponse {
+  uint64 count = 1;
+  string error = 2;
+}
+
+// ─── Update messages ─────────────────────────
+
+message UpdateRequest {
+  string database   = 1;
+  string collection = 2;
+  string id         = 3;
+  string patch_json = 4;  // JSON patch: plain object or with $set/$unset/$inc/$push/$pull
+}
+
+message UpdateWhereRequest {
+  string database    = 1;
+  string collection  = 2;
+  string filter_json = 3;  // JSON filter expression
+  string patch_json  = 4;  // JSON patch
+}
+
+message UpdateResponse {
+  bool   success        = 1;
+  uint64 modified_count = 2;
+  string error          = 3;
+}
+
+// ─── Rich query messages ─────────────────────
+
+message QueryRequest {
+  string database              = 1;
+  string collection            = 2;
+  string filter_json           = 3;  // MongoDB-style filter: {"age": {"$gt": 25}}
+  PaginationOptions pagination = 4;
+  SortOptions       sort       = 5;
+}
+
+// ─── Aggregation messages ────────────────────
+
+message AggregateRequest {
+  string database      = 1;
+  string collection    = 2;
+  string pipeline_json = 3;  // JSON array of pipeline stages
+}
+
+message AggregateResponse {
+  repeated string results_json = 1;
+  string          error        = 2;
+}
+
+// ─── Index messages ──────────────────────────
+
+message IndexRequest {
+  string database   = 1;
+  string collection = 2;
+  string field      = 3;
+  bool   unique     = 4;
+}
+
+message ListIndexesRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message ListIndexesResponse {
+  repeated IndexInfo indexes = 1;
+}
+
+message IndexInfo {
+  string field  = 1;
+  bool   unique = 2;
+}
+
+// ─── Schema messages ─────────────────────────
+
+message SetSchemaRequest {
+  string database    = 1;
+  string collection  = 2;
+  string schema_json = 3;  // CollectionSchema as JSON
+}
+
+message GetSchemaRequest {
+  string database   = 1;
+  string collection = 2;
+}
+
+message GetSchemaResponse {
+  bool   found       = 1;
+  string schema_json = 2;
+}
+
+// ─── Transaction messages ────────────────────
+
+message TxResponse {
+  string tx_id = 1;
+}
+
+message TxRequest {
+  string tx_id = 1;
+}
+
+message TxInsertRequest {
+  string tx_id         = 1;
+  string database      = 2;
+  string collection    = 3;
+  string document_json = 4;
+}
+
+message TxUpdateRequest {
+  string tx_id      = 1;
+  string database   = 2;
+  string collection = 3;
+  string id         = 4;
+  string patch_json = 5;
+}
+
+message TxDeleteRequest {
+  string tx_id      = 1;
+  string database   = 2;
+  string collection = 3;
+  string id         = 4;
+}
+
+message TxFindByIdRequest {
+  string tx_id      = 1;
+  string database   = 2;
+  string collection = 3;
+  string id         = 4;
+}
+
+// ─── Change feed messages ────────────────────
+
+message WatchRequest {
+  string database       = 1;
+  string collection     = 2;
+  uint64 since_sequence = 3;  // 0 = live only, >0 = replay from this sequence
+}
+
+message WatchEvent {
+  uint64 sequence      = 1;
+  string operation     = 2;  // "insert", "update", "delete"
+  string doc_id        = 3;
+  string document_json = 4;  // empty for deletes
+  string timestamp     = 5;
+}
+
+// ─── Explain messages ────────────────────────
+
+message ExplainResponse {
+  string plan_type      = 1;  // "FullScan" or "IndexScan"
+  string index_field    = 2;
+  string index_type     = 3;  // "BTree" or "Hash"
+  string predicate      = 4;  // e.g. "age $gt 25"
+  bool   has_residual   = 5;
+  double selectivity    = 6;
+  uint64 total_docs     = 7;
+  uint64 estimated_scan = 8;
+}
